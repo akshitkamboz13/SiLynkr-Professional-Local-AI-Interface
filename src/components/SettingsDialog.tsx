@@ -36,6 +36,11 @@ interface SettingsDialogProps {
   setThinkingEnabled: (value: boolean) => void;
   rawModeEnabled: boolean;
   setRawModeEnabled: (value: boolean) => void;
+  ollamaConnectionMode: 'server-proxy' | 'browser-local';
+  setOllamaConnectionMode: (value: 'server-proxy' | 'browser-local') => void;
+  ollamaBaseUrl: string;
+  setOllamaBaseUrl: (value: string) => void;
+  saveOllamaConnection: () => void;
 }
 
 export default function SettingsDialog({
@@ -71,6 +76,11 @@ export default function SettingsDialog({
   setThinkingEnabled,
   rawModeEnabled,
   setRawModeEnabled,
+  ollamaConnectionMode,
+  setOllamaConnectionMode,
+  ollamaBaseUrl,
+  setOllamaBaseUrl,
+  saveOllamaConnection,
 }: SettingsDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -104,21 +114,21 @@ export default function SettingsDialog({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm bg-white/30 dark:bg-gray-900/30 overflow-y-auto">
+    <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm bg-black/30 dark:bg-white/10 overflow-y-auto">
       <div 
         ref={dialogRef}
-        className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-3xl w-full max-h-[90vh] overflow-y-auto transform transition-all animate-fade-in-up"
+        className="bg-card rounded-lg shadow-xl max-w-3xl w-full max-h-[90vh] overflow-y-auto transform transition-all animate-fade-in-up border border-border"
       >
-        <div className="p-5 border-b dark:border-gray-700 flex items-center justify-between">
+        <div className="p-5 border-b border-border flex items-center justify-between">
           <div>
-            <h2 className="text-xl font-medium text-gray-900 dark:text-white">Settings</h2>
-            <div className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              SiLynkr {getVersionString()} by <a href="https://si4k.me" target="_blank" rel="noopener noreferrer" className="underline hover:text-[#6C63FF]">Si4k</a>
+            <h2 className="text-xl font-medium text-foreground">Settings</h2>
+            <div className="text-xs text-muted-foreground mt-1">
+              SiLynkr {getVersionString()} by <a href="https://si4k.me" target="_blank" rel="noopener noreferrer" className="underline hover:text-primary">Si4k</a>
             </div>
           </div>
           <button 
             onClick={onClose} 
-            className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-300 focus:outline-none"
+            className="text-muted-foreground hover:text-foreground focus:outline-none"
           >
             <X size={20} />
           </button>
@@ -156,13 +166,18 @@ export default function SettingsDialog({
             setThinkingEnabled={setThinkingEnabled}
             rawModeEnabled={rawModeEnabled}
             setRawModeEnabled={setRawModeEnabled}
+            ollamaConnectionMode={ollamaConnectionMode}
+            setOllamaConnectionMode={setOllamaConnectionMode}
+            ollamaBaseUrl={ollamaBaseUrl}
+            setOllamaBaseUrl={setOllamaBaseUrl}
+            saveOllamaConnection={saveOllamaConnection}
           />
         </div>
         
-        <div className="p-4 border-t dark:border-gray-700 flex justify-end">
+        <div className="p-4 border-t border-border flex justify-end">
           <button
             onClick={onClose}
-            className="px-4 py-2 bg-[#6C63FF] hover:bg-[#5754D2] text-white rounded-md shadow-sm text-sm"
+            className="px-4 py-2 bg-primary hover:bg-primary-hover text-primary-foreground rounded-md shadow-sm text-sm"
           >
             Close
           </button>

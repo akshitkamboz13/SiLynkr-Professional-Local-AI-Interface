@@ -1,16 +1,21 @@
 'use client';
 
-import { useState, useEffect, FormEvent, useRef } from 'react';
+import { useState, useEffect, FormEvent, useRef, DragEvent, useLayoutEffect, useCallback } from 'react';
 import { ModelInfo } from '../../services/ollamaService';
 import ChatMessage from './ChatMessage';
-import { useRouter, useSearchParams } from 'next/navigation';
-import { Menu, X, Plus, Settings, Folder as FolderIcon, Tag as TagIcon, Share, Moon, Sun, Database, MessageSquare, AlertCircle } from 'lucide-react';
-import { Message, truncateConversationHistory, createPromptWithHistory } from '@/lib/conversationUtils';
+import { useRouter } from 'next/navigation';
+import { Menu, X, Plus, Settings, Folder as FolderIcon, Tag as TagIcon, Share, Moon, Sun, Database, MessageSquare, AlertCircle, Info, Edit, FolderPlus, Palette, Pause } from 'lucide-react';
+import { Message, truncateConversationHistory, createPromptWithHistory, createPromptWithHistoryAndFeedback } from '@/lib/conversationUtils';
 import ShareDialog from './ShareDialog';
 import SettingsDialog from './SettingsDialog';
-import { getVersionString } from '@/lib/version';
+import { getVersionString, getVersionInfo } from '@/lib/version';
 import Image from 'next/image';
 import PortIndicator from './PortIndicator';
+import { ThemeType, CustomThemeColors } from './ThemeManager';
+import ThemeManager from './ThemeManager';
+import { applyTheme, getStoredTheme, getStoredCustomColors } from '../lib/ThemeService';
+import { exportTheme as exportThemeToFile, importTheme as importThemeFromFile } from '@/lib/ThemeService';
+import { ThemeExport } from './ThemeManager';
 
 interface Folder {
   _id: string;
@@ -42,10 +47,32 @@ interface ChatInterfaceProps {
   conversationId?: string;
 }
 
+type OllamaConnectionMode = 'server-proxy' | 'browser-local';
+
+const DEFAULT_OLLAMA_BASE_URL = 'http://127.0.0.1:11434/api';
+
 interface DragItem {
   type: 'conversation' | 'folder';
   id: string;
   folderId?: string | null;
+}
+
+// Update the folder context menu interface to include renaming
+interface FolderContextMenu {
+  show: boolean;
+  x: number;
+  y: number;
+  folder: Folder | null;
+  isRenaming?: boolean;
+}
+
+// Update the conversation context menu to include renaming
+interface ConversationContextMenu {
+  show: boolean;
+  x: number;
+  y: number;
+  conversation: SavedConversation | null;
+  isRenaming?: boolean;
 }
 
 export default function ChatInterface({ conversationId }: ChatInterfaceProps = {}) {
@@ -56,13 +83,16 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   const [input, setInput] = useState<string>('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
+  const [streamingMessageIndex, setStreamingMessageIndex] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [temperature, setTemperature] = useState<number>(0.7);
   const [darkMode, setDarkMode] = useState<boolean>(false);
-  const [theme, setTheme] = useState<'light' | 'dark' | 'obsidian' | 'nature' | 'sunset' | 'custom'>('light');
+  const [theme, setTheme] = useState<ThemeType>('light');
+  const [customThemeColors, setCustomThemeColors] = useState<CustomThemeColors>(getStoredCustomColors());
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(256); // Default width of 256px (64 in rem units)
   const [isResizing, setIsResizing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false); // Add this missing state variable
   const sidebarRef = useRef<HTMLDivElement>(null);
   const resizeRef = useRef<HTMLDivElement>(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -80,7 +110,11 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     expiresAt: null
   });
   const [mongodbUri, setMongodbUri] = useState<string>('');
+  const [ollamaConnectionMode, setOllamaConnectionMode] = useState<OllamaConnectionMode>('server-proxy');
+  const [ollamaBaseUrl, setOllamaBaseUrl] = useState<string>(DEFAULT_OLLAMA_BASE_URL);
   const [usingLocalStorage, setUsingLocalStorage] = useState<boolean>(true);
+  const [clientId, setClientId] = useState<string>('');
+  const [settingsLoaded, setSettingsLoaded] = useState<boolean>(false);
   const [historyLength, setHistoryLength] = useState<number>(10);
   const [useConversationHistory, setUseConversationHistory] = useState<boolean>(true);
   const [promptTokens, setPromptTokens] = useState<number>(0);
@@ -97,10 +131,12 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   const [newFolderName, setNewFolderName] = useState<string>('');
   const [showNewFolderInput, setShowNewFolderInput] = useState<boolean>(false);
-  const [contextMenuPosition, setContextMenuPosition] = useState<{ x: number; y: number; conversation: SavedConversation | null }>({
+  const [contextMenuPosition, setContextMenuPosition] = useState<ConversationContextMenu>({
+    show: false,
     x: 0,
     y: 0,
-    conversation: null
+    conversation: null,
+    isRenaming: false
   });
   const [showMoveDialog, setShowMoveDialog] = useState<boolean>(false);
   const [conversationToMove, setConversationToMove] = useState<SavedConversation | null>(null);
@@ -118,14 +154,12 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   const [suffixText, setSuffixText] = useState<string>('');
   const [customTemplate, setCustomTemplate] = useState<string>('');
   const [showSettingsDialog, setShowSettingsDialog] = useState<boolean>(false);
-  const [folderContextMenu, setFolderContextMenu] = useState<{
-    x: number;
-    y: number;
-    folder: Folder | null
-  }>({
+  const [folderContextMenu, setFolderContextMenu] = useState<FolderContextMenu>({
+    show: false,
     x: 0,
     y: 0,
-    folder: null
+    folder: null,
+    isRenaming: false
   });
   
   // Add new state variables for message versions and editing
@@ -157,13 +191,92 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   });
   
   const router = useRouter();
-  const searchParams = useSearchParams();
+
+  const normalizeOllamaBaseUrl = (url: string) => {
+    const trimmed = (url || '').trim();
+    if (!trimmed) return DEFAULT_OLLAMA_BASE_URL;
+    return trimmed.replace(/\/+$/, '');
+  };
+
+  const getUsingBrowserLocalOllama = () => ollamaConnectionMode === 'browser-local';
+
+  const getOllamaModelsEndpoint = () => {
+    if (getUsingBrowserLocalOllama()) {
+      return `${normalizeOllamaBaseUrl(ollamaBaseUrl)}/tags`;
+    }
+    return '/api/models';
+  };
+
+  const getOllamaGenerateEndpoint = () => {
+    if (getUsingBrowserLocalOllama()) {
+      return `${normalizeOllamaBaseUrl(ollamaBaseUrl)}/generate`;
+    }
+    return '/api/generate';
+  };
+
+  const createGenerateRequestBody = (
+    model: string,
+    promptWithHistory: string,
+    rawPrompt: string,
+    conversationHistory: Message[]
+  ) => {
+    const commonPayload = {
+      model,
+      prompt: promptWithHistory,
+      system: systemPrompt,
+      stream: true,
+      options: {
+        temperature,
+        top_p: topP,
+        top_k: topK
+      },
+      suffix: suffixText || undefined,
+      format: formatOption || undefined,
+      template: customTemplate || undefined,
+      think: thinkingEnabled,
+      raw: rawModeEnabled,
+      keep_alive: keepAliveOption,
+    };
+
+    if (getUsingBrowserLocalOllama()) {
+      return commonPayload;
+    }
+
+    return {
+      ...commonPayload,
+      rawPrompt,
+      conversationHistory: useConversationHistory
+        ? conversationHistory.map(msg => ({
+            role: msg.role,
+            content: msg.content,
+            feedback: msg.feedback,
+            comments: msg.comments
+          }))
+        : []
+    };
+  };
+
+  // Abort controller to allow pausing/stopping a streaming generation.
+  const generationAbortControllerRef = useRef<AbortController | null>(null);
+
+  const pauseGeneration = () => {
+    if (generationAbortControllerRef.current) {
+      generationAbortControllerRef.current.abort();
+      generationAbortControllerRef.current = null;
+    }
+    setLoading(false);
+    setStreamingMessageIndex(null);
+    showToast('Paused generation', 'info');
+  };
   
   // Handle URL parameters
   useEffect(() => {
-    const modelParam = searchParams.get('model');
-    const tempParam = searchParams.get('temperature');
-    const systemPromptParam = searchParams.get('systemPrompt');
+    if (typeof window === 'undefined') return;
+
+    const params = new URLSearchParams(window.location.search);
+    const modelParam = params.get('model');
+    const tempParam = params.get('temperature');
+    const systemPromptParam = params.get('systemPrompt');
     
     if (modelParam && models.some(m => m.name === modelParam)) {
       setSelectedModel(modelParam);
@@ -179,7 +292,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     if (systemPromptParam) {
       setSystemPrompt(systemPromptParam);
     }
-  }, [searchParams, models]);
+  }, [models]);
   
   // Fetch folders and tags
   useEffect(() => {
@@ -236,8 +349,210 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
       const savedUri = localStorage.getItem('MONGODB_URI') || '';
       setMongodbUri(savedUri);
       setUsingLocalStorage(!savedUri);
+
+      const savedOllamaMode = localStorage.getItem('SILYNKR_OLLAMA_CONNECTION_MODE');
+      const savedOllamaBaseUrl = localStorage.getItem('SILYNKR_OLLAMA_BASE_URL');
+
+      if (savedOllamaMode === 'browser-local' || savedOllamaMode === 'server-proxy') {
+        setOllamaConnectionMode(savedOllamaMode);
+      }
+
+      if (savedOllamaBaseUrl) {
+        setOllamaBaseUrl(savedOllamaBaseUrl);
+      }
     }
   }, []);
+
+  // Stable per-install identifier (used to persist settings in MongoDB)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    let id = localStorage.getItem('SILYNKR_CLIENT_ID') || '';
+
+    if (!id) {
+      // Prefer the built-in UUID generator when available
+      const cryptoObj = (typeof globalThis !== 'undefined' && 'crypto' in globalThis)
+        ? (globalThis.crypto as Crypto | undefined)
+        : undefined;
+      id = typeof cryptoObj?.randomUUID === 'function'
+        ? cryptoObj.randomUUID()
+        : `silynkr_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      localStorage.setItem('SILYNKR_CLIENT_ID', id);
+    }
+
+    setClientId(id);
+  }, []);
+
+  const fetchUserSettings = async () => {
+    if (typeof window === 'undefined') return;
+    if (!clientId) return;
+
+    try {
+      const storedMongoUri = localStorage.getItem('MONGODB_URI') || '';
+      const headers: Record<string, string> = {
+        'X-Client-Id': clientId,
+        'Cache-Control': 'no-cache'
+      };
+
+      if (storedMongoUri) {
+        headers['X-MongoDB-URI'] = storedMongoUri;
+      }
+
+      const response = await fetch(`/api/settings?t=${Date.now()}`, { headers });
+      const data = await response.json();
+
+      if (!data?.success) {
+        console.error('Failed to load settings:', data?.error);
+        setSettingsLoaded(true);
+        return;
+      }
+
+      const s = data.settings || {};
+
+      const isThemeType = (value: unknown): value is ThemeType =>
+        value === 'light' || value === 'dark' || value === 'custom';
+
+      // Core settings
+      if (typeof s.systemPrompt === 'string') setSystemPrompt(s.systemPrompt);
+      if (typeof s.temperature === 'number') setTemperature(s.temperature);
+      if (typeof s.useConversationHistory === 'boolean') setUseConversationHistory(s.useConversationHistory);
+      if (typeof s.historyLength === 'number') setHistoryLength(s.historyLength);
+      if (typeof s.autoSave === 'boolean') setAutoSave(s.autoSave);
+
+      // Advanced generation settings
+      if (typeof s.formatOption === 'string') setFormatOption(s.formatOption);
+      if (typeof s.topP === 'number') setTopP(s.topP);
+      if (typeof s.topK === 'number') setTopK(s.topK);
+      if (typeof s.suffixText === 'string') setSuffixText(s.suffixText);
+      if (typeof s.customTemplate === 'string') setCustomTemplate(s.customTemplate);
+      if (typeof s.keepAliveOption === 'string') setKeepAliveOption(s.keepAliveOption);
+      if (typeof s.thinkingEnabled === 'boolean') setThinkingEnabled(s.thinkingEnabled);
+      if (typeof s.rawModeEnabled === 'boolean') setRawModeEnabled(s.rawModeEnabled);
+      if (s.ollamaConnectionMode === 'browser-local' || s.ollamaConnectionMode === 'server-proxy') {
+        setOllamaConnectionMode(s.ollamaConnectionMode);
+        localStorage.setItem('SILYNKR_OLLAMA_CONNECTION_MODE', s.ollamaConnectionMode);
+      }
+      if (typeof s.ollamaBaseUrl === 'string' && s.ollamaBaseUrl.trim()) {
+        setOllamaBaseUrl(s.ollamaBaseUrl);
+        localStorage.setItem('SILYNKR_OLLAMA_BASE_URL', s.ollamaBaseUrl);
+      }
+
+      // UI settings
+      if (typeof s.sidebarWidth === 'number') {
+        setSidebarWidth(s.sidebarWidth);
+        localStorage.setItem('silynkr-sidebar-width', String(s.sidebarWidth));
+      }
+
+      if (isThemeType(s.theme)) {
+        setAppTheme(s.theme);
+      }
+
+      if (s.customThemeColors && typeof s.customThemeColors === 'object') {
+        handleCustomColorsChange(s.customThemeColors as CustomThemeColors);
+      }
+
+      // Source indicator (server env MongoDB works even if browser has no URI)
+      if (data.source) {
+        setUsingLocalStorage(data.source !== 'mongo');
+      }
+    } catch (err) {
+      console.error('Error loading settings:', err);
+    } finally {
+      setSettingsLoaded(true);
+    }
+  };
+
+  // Load persisted settings (re-run when MongoDB URI changes, e.g., user switches DB)
+  useEffect(() => {
+    if (!clientId) return;
+    fetchUserSettings();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientId, mongodbUri]);
+
+  const persistUserSettings = async () => {
+    if (typeof window === 'undefined') return;
+    if (!clientId) return;
+
+    try {
+      const storedMongoUri = localStorage.getItem('MONGODB_URI') || '';
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Client-Id': clientId
+      };
+
+      if (storedMongoUri) {
+        headers['X-MongoDB-URI'] = storedMongoUri;
+      }
+
+      const settingsPayload = {
+        systemPrompt,
+        temperature,
+        useConversationHistory,
+        historyLength,
+        autoSave,
+        formatOption,
+        topP,
+        topK,
+        suffixText,
+        customTemplate,
+        keepAliveOption,
+        thinkingEnabled,
+        rawModeEnabled,
+        ollamaConnectionMode,
+        ollamaBaseUrl,
+        theme,
+        customThemeColors,
+        sidebarWidth
+      };
+
+      const response = await fetch('/api/settings', {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify({ settings: settingsPayload })
+      });
+
+      const data = await response.json();
+      if (data?.source) {
+        setUsingLocalStorage(data.source !== 'mongo');
+      }
+    } catch (err) {
+      console.error('Error saving settings:', err);
+    }
+  };
+
+  // Debounced auto-save for settings (includes system prompt)
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    if (!clientId) return;
+
+    const t = setTimeout(() => {
+      persistUserSettings();
+    }, 800);
+
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    settingsLoaded,
+    clientId,
+    systemPrompt,
+    temperature,
+    useConversationHistory,
+    historyLength,
+    autoSave,
+    formatOption,
+    topP,
+    topK,
+    suffixText,
+    customTemplate,
+    keepAliveOption,
+    thinkingEnabled,
+    rawModeEnabled,
+    ollamaConnectionMode,
+    ollamaBaseUrl,
+    theme,
+    customThemeColors,
+    sidebarWidth
+  ]);
 
   // Function to show toast with improved animation handling
   const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
@@ -264,6 +579,38 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     setTimeout(() => setToast(null), 300); // Match animation duration
   };
 
+  const saveOllamaConnection = async () => {
+    try {
+      const normalizedBaseUrl = normalizeOllamaBaseUrl(ollamaBaseUrl);
+
+      localStorage.setItem('SILYNKR_OLLAMA_CONNECTION_MODE', ollamaConnectionMode);
+      localStorage.setItem('SILYNKR_OLLAMA_BASE_URL', normalizedBaseUrl);
+      setOllamaBaseUrl(normalizedBaseUrl);
+
+      if (ollamaConnectionMode === 'browser-local') {
+        const testResponse = await fetch(`${normalizedBaseUrl}/tags`);
+        if (!testResponse.ok) {
+          throw new Error(`Local Ollama test failed with status ${testResponse.status}`);
+        }
+      }
+
+      await fetchModels();
+
+      showToast(
+        ollamaConnectionMode === 'browser-local'
+          ? 'Saved. Browser Local mode enabled for this device.'
+          : 'Saved. Server Proxy mode enabled.',
+        'success'
+      );
+    } catch (err) {
+      console.error('Error validating Ollama connection:', err);
+      showToast(
+        'Could not reach local Ollama from the browser. If this is a hosted HTTPS site, browser security may block localhost access. Use local app mode at http://localhost:49494.',
+        'error'
+      );
+    }
+  };
+
   // Update saveMongoDbUri to use toast and close settings panel
   const saveMongoDbUri = async () => {
     try {
@@ -280,24 +627,29 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
         const data = await response.json();
 
         if (data.success) {
-        localStorage.setItem('MONGODB_URI', mongodbUri);
-        setUsingLocalStorage(false);
+          localStorage.setItem('MONGODB_URI', mongodbUri);
+          setUsingLocalStorage(false);
           showToast('MongoDB connection successful! URI saved.', 'success');
           setShowSettings(false); // Close settings panel
 
           // Fetch conversations after successful connection
-          setTimeout(() => fetchSavedConversations(), 500);
+          setTimeout(() => {
+            fetchSavedConversations();
+            fetchUserSettings();
+          }, 500);
         } else {
           showToast(`MongoDB connection failed: ${data.error || data.message}`, 'error');
         }
       } else {
         localStorage.removeItem('MONGODB_URI');
-        setUsingLocalStorage(true);
-        showToast('MongoDB URI removed. Using local storage instead.', 'info');
+        showToast('MongoDB URI cleared. Using server-side MongoDB if configured; otherwise falling back to local storage.', 'info');
         setShowSettings(false); // Close settings panel
 
-        // Fetch conversations after removing URI (to get local storage conversations)
-        setTimeout(() => fetchSavedConversations(), 500);
+        // Re-evaluate storage source after removing URI
+        setTimeout(() => {
+          fetchSavedConversations();
+          fetchUserSettings();
+        }, 500);
       }
     } catch (err) {
       console.error('Error testing MongoDB connection:', err);
@@ -307,108 +659,163 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   
   // Update saveConversation function to track saved state
   const saveConversation = async () => {
-    if (messages.length === 0) {
-      showToast('Nothing to save. Start a conversation first.', 'info');
-      return;
-    }
-
-    // Show "Saving..." toast immediately
-    showToast('Saving conversation...', 'info');
-
     try {
-      // Generate a better title based on first message
-      const title = generateConversationTitle(messages);
+      setIsSaving(true);
+      let savedId = currentConversationId;
 
-      const conversation = {
-        title,
-        messages,
-        model: selectedModel,
-        systemPrompt,
-        parameters: { temperature },
-        folderId: currentFolder,
-        tags: selectedTags,
-        isShared,
-        shareSettings
-      };
-      
-      // Get MongoDB URI from localStorage if available
-      const storedMongoUri = typeof window !== 'undefined'
+      const activeMongoUri = mongodbUri || (typeof window !== 'undefined'
         ? localStorage.getItem('MONGODB_URI') || ''
-        : '';
+        : '');
 
-      // Use API endpoint to save
-      const method = currentConversationId ? 'PUT' : 'POST';
-      const url = currentConversationId
-        ? `/api/conversations/${currentConversationId}`
-        : '/api/conversations';
+      const baseHeaders: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
 
-      const response = await fetch(url, {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-MongoDB-URI': storedMongoUri
-        },
-        body: JSON.stringify({ conversation }),
-      });
+      if (activeMongoUri) {
+        baseHeaders['X-MongoDB-URI'] = activeMongoUri;
+      }
+      
+      // Format messages to remove undefined values before sending to API
+      const formattedMessages = messages.map(msg => ({
+        role: msg.role,
+        content: msg.content,
+        timestamp: msg.timestamp,
+        jsonContent: msg.jsonContent,
+        editedAt: msg.editedAt,
+        comments: msg.comments,
+        feedback: msg.feedback
+      }));
 
-      const data = await response.json();
-
-      if (data.success) {
-        // Update saved state and conversation ID if new
-        setLastConversationSaved(true);
-        if (data.conversation && data.conversation._id) {
-          setCurrentConversationId(data.conversation._id);
-
-          // Auto-expand the folder if saving to a folder
-          if (currentFolder) {
-            setExpandedFolders(prev => ({
-              ...prev,
-              [currentFolder]: true
-            }));
-          }
-
-          // If this is an update to an existing conversation, update it in the savedConversations list
-          if (currentConversationId) {
-            setSavedConversations(prev =>
-              prev.map(conv =>
-                conv._id === currentConversationId
-                  ? {
-                    ...conv,
-                    title,
-                    folderId: currentFolder,
-                    updatedAt: new Date()
-                  }
-                  : conv
-              )
-            );
-          } else {
-            // If this is a new conversation, add it to the savedConversations list
-            const newConversation = {
-              _id: data.conversation._id,
-              title,
-              messages,
-              model: selectedModel,
-              folderId: currentFolder,
-              tags: selectedTags,
-              createdAt: new Date(),
-              updatedAt: new Date()
-            };
-
-            setSavedConversations(prev => [newConversation, ...prev]);
+      const normalizeDate = (value: unknown) => {
+        if (value instanceof Date) return value;
+        if (typeof value === 'string' || typeof value === 'number') {
+          const parsed = new Date(value);
+          if (!Number.isNaN(parsed.getTime())) {
+            return parsed;
           }
         }
+        return new Date();
+      };
 
-        // Refresh conversations list with a slight delay to ensure DB consistency
-        setTimeout(() => fetchSavedConversations(), 500);
+      const existingConversation = currentConversationId
+        ? savedConversations.find(c => c._id === currentConversationId)
+        : null;
 
-        showToast('Conversation saved successfully!', 'success');
+      const defaultTitle = messages.length > 0
+        ? generateConversationTitle(messages)
+        : 'New conversation';
+
+      const conversationTitle = existingConversation?.title || defaultTitle;
+
+      const conversationPayload = {
+        title: conversationTitle,
+        messages: formattedMessages,
+        model: selectedModel,
+        systemPrompt,
+        folderId: currentFolder,
+        tags: selectedTags,
+        parameters: {
+          temperature,
+          topP,
+          topK,
+          formatOption,
+          suffixText,
+          customTemplate,
+          keepAlive: keepAliveOption,
+        }
+      };
+
+      let serverConversation: SavedConversation | null = null;
+
+      if (currentConversationId) {
+        // Update existing conversation
+        const response = await fetch(`/api/conversations/${currentConversationId}`, {
+          method: 'PUT',
+          headers: baseHeaders,
+          body: JSON.stringify({
+            conversation: conversationPayload
+          }),
+        });
+        
+        if (!response.ok) {
+          throw new Error('Failed to save conversation');
+        }
+        
+        const data = await response.json();
+        if (!data.success || !data.conversation) {
+          throw new Error(data.error || 'Failed to save conversation');
+        }
+
+        serverConversation = data.conversation;
+        savedId = serverConversation._id;
+        
+        showToast('Conversation updated', 'success');
       } else {
-        throw new Error(data.error || 'Failed to save conversation');
+        // Create a new conversation
+        const response = await fetch('/api/conversations', {
+          method: 'POST',
+          headers: baseHeaders,
+          body: JSON.stringify({
+            conversation: conversationPayload
+          }),
+        });
+        
+        if (!response.ok) {
+          throw new Error('Failed to create conversation');
+        }
+        
+        const data = await response.json();
+        if (!data.success || !data.conversation) {
+          throw new Error(data.error || 'Failed to create conversation');
+        }
+
+        serverConversation = data.conversation;
+        savedId = serverConversation._id;
+        
+        // Update URL to include the new conversation ID
+        router.push(`/${savedId}`);
+        setCurrentConversationId(savedId);
+        showToast('Conversation saved', 'success');
       }
-    } catch (err) {
-      console.error('Error saving conversation:', err);
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
-      showToast(`Failed to save: ${errorMessage}`, 'error');
+      
+      // Update the conversation in the savedConversations list
+      setSavedConversations(prev => {
+        const updated = [...prev];
+        const existingIndex = updated.findIndex(c => c._id === savedId);
+        const finalConversation = serverConversation || {
+          ...conversationPayload,
+          _id: savedId!,
+          updatedAt: new Date(),
+          createdAt: existingConversation?.createdAt || new Date()
+        } as SavedConversation;
+
+        if (existingIndex >= 0) {
+          updated[existingIndex] = {
+            ...updated[existingIndex],
+            ...finalConversation,
+            _id: savedId,
+            updatedAt: normalizeDate(finalConversation.updatedAt)
+          };
+        } else if (savedId) {
+          updated.unshift({
+            ...finalConversation,
+            _id: savedId,
+            createdAt: normalizeDate(finalConversation.createdAt),
+            updatedAt: normalizeDate(finalConversation.updatedAt)
+          });
+        }
+        
+        return updated;
+      });
+      
+      setLastConversationSaved(true);
+      return savedId;
+    } catch (error) {
+      console.error('Error saving conversation:', error);
+      showToast('Failed to save conversation', 'error');
+      return null;
+    } finally {
+      setIsSaving(false);
     }
   };
   
@@ -438,42 +845,58 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     scrollToBottom();
   }, [messages]);
   
-  // Check system preference for dark mode
+  // Update theme initialization to use data-theme attribute 
   useEffect(() => {
     // Get theme from local storage or system preference
     if (typeof window !== 'undefined') {
-      const savedTheme = localStorage.getItem('silynkr-theme') as 'light' | 'dark' | 'obsidian' | 'nature' | 'sunset' | 'custom' | null;
-
-      if (savedTheme) {
-        setAppTheme(savedTheme);
-      } else {
-        // Default to system preference for dark mode
-    const isDarkMode = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        setAppTheme(isDarkMode ? 'dark' : 'light');
-      }
+      const storedTheme = getStoredTheme();
+      console.log('Initial theme from storage:', storedTheme);
+      
+      setTheme(storedTheme);
+      setDarkMode(storedTheme !== 'light');
+      
+      // Get stored custom colors if available
+      const storedCustomColors = getStoredCustomColors();
+      setCustomThemeColors(storedCustomColors);
+      
+      // Apply the theme directly with the ThemeService
+      applyTheme(storedTheme, storedTheme === 'custom' ? storedCustomColors : undefined);
     }
   }, []);
+
+  const fetchModels = useCallback(async () => {
+    try {
+      setError(null);
+      const endpoint = getOllamaModelsEndpoint();
+      const response = await fetch(endpoint);
+
+      if (!response.ok) {
+        throw new Error(`Models request failed (${response.status})`);
+      }
+
+      const data = await response.json();
+      const modelList = Array.isArray(data.models) ? data.models : [];
+
+      if (modelList.length > 0) {
+        setModels(modelList);
+        setSelectedModel(prev => prev || modelList[0].name);
+      } else {
+        setError('No models available. Please make sure you have models installed in Ollama.');
+      }
+    } catch (err) {
+      const usingBrowserLocal = getUsingBrowserLocalOllama();
+      setError(
+        usingBrowserLocal
+          ? 'Failed to load models from your local Ollama. Check that Ollama is running and your browser allows localhost access from this site.'
+          : 'Failed to load models. Make sure Ollama is running.'
+      );
+      console.error('Error fetching models:', err);
+    }
+  }, [ollamaConnectionMode, ollamaBaseUrl]);
 
   useEffect(() => {
-    async function fetchModels() {
-      try {
-        setError(null);
-        const response = await fetch('/api/models');
-        const data = await response.json();
-        if (data.models && data.models.length > 0) {
-          setModels(data.models);
-          setSelectedModel(data.models[0].name);
-        } else {
-          setError('No models available. Please make sure you have models installed in Ollama.');
-        }
-      } catch (err) {
-        setError('Failed to load models. Make sure Ollama is running.');
-        console.error('Error fetching models:', err);
-      }
-    }
-
     fetchModels();
-  }, []);
+  }, [fetchModels]);
 
   // Function to regenerate a specific message using a selected model
   const regenerateMessage = async (messageIndex: number, modelName: string) => {
@@ -490,11 +913,30 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     
     const userMessage = messages[userMessageIndex];
     
+    // If something is already generating, pause it first.
+    if (generationAbortControllerRef.current) {
+      generationAbortControllerRef.current.abort();
+      generationAbortControllerRef.current = null;
+    }
+
     // Show loading state
     setLoading(true);
     setError(null);
+    setStreamingMessageIndex(messageIndex);
+
+    // Clear the current assistant message so the user sees the loader immediately.
+    setMessages(prev => {
+      const next = [...prev];
+      if (next[messageIndex] && next[messageIndex].role === 'assistant') {
+        next[messageIndex] = { ...next[messageIndex], content: '', timestamp: new Date() };
+      }
+      return next;
+    });
     
     try {
+      const controller = new AbortController();
+      generationAbortControllerRef.current = controller;
+
       // Get recent conversation history excluding the message we're regenerating
       const conversationHistory = useConversationHistory 
         ? truncateConversationHistory(
@@ -503,97 +945,114 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
           )
         : [];
       
-      // Create prompt with conversation history if enabled
+      // Create prompt with conversation history and feedback if enabled
       const promptWithHistory = useConversationHistory
-        ? createPromptWithHistory(userMessage.content, conversationHistory)
+        ? createPromptWithHistoryAndFeedback(userMessage.content, conversationHistory)
         : userMessage.content;
       
-      const response = await fetch('/api/generate', {
+      const response = await fetch(getOllamaGenerateEndpoint(), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          model: modelName,
-          prompt: promptWithHistory,
-          rawPrompt: userMessage.content, // Original prompt without history
-          system: systemPrompt,
-          options: {
-            temperature,
-            top_p: topP,
-            top_k: topK
-          },
-          suffix: suffixText || undefined,
-          format: formatOption || undefined,
-          template: customTemplate || undefined,
-          think: thinkingEnabled,
-          raw: rawModeEnabled,
-          keep_alive: keepAliveOption,
-          conversationHistory: useConversationHistory ? conversationHistory.map(msg => ({
-            role: msg.role,
-            content: msg.content
-          })) : []
-        }),
+        signal: controller.signal,
+        body: JSON.stringify(
+          createGenerateRequestBody(
+            modelName,
+            promptWithHistory,
+            userMessage.content,
+            conversationHistory
+          )
+        ),
       });
       
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`API error (${response.status}): ${errorText}`);
       }
-      
-      const data = await response.json();
-      
-      if (data.error) {
-        setError(data.error);
-      } else {
-        // Create new message with regenerated content
-        const newMessage: Message = {
-          role: 'assistant',
-          content: data.response,
-          timestamp: new Date()
-        };
-        
-        // Store the new version in messageVersions
-        const messageId = messageIndex;
-        const currentVersions = messageVersions[messageId] || [messages[messageIndex].content];
-        const updatedVersions = [...currentVersions, newMessage.content];
-        
-        setMessageVersions({
-          ...messageVersions,
-          [messageId]: updatedVersions
-        });
-        
-        // Set current version to the newest one
-        setCurrentMessageVersions({
-          ...currentMessageVersions,
-          [messageId]: updatedVersions.length - 1
-        });
-        
-        // Update the message in the messages array
-        const updatedMessages = [...messages];
-        updatedMessages[messageIndex] = newMessage;
-        setMessages(updatedMessages);
-        
-        // Track token usage if available
-        if (data.promptTokens || data.completionTokens) {
-          setPromptTokens(data.promptTokens || 0);
-          setCompletionTokens(data.completionTokens || 0);
-          setTotalTokens((data.promptTokens || 0) + (data.completionTokens || 0));
-          
-          // Show token usage briefly
-          setShowTokenUsage(true);
-          setTimeout(() => setShowTokenUsage(false), 5000);
-        }
-        
-        // Mark conversation as unsaved
-        setLastConversationSaved(false);
+
+      if (!response.body) {
+        throw new Error('Streaming response body missing');
       }
+
+      const decoder = new TextDecoder();
+      const reader = response.body.getReader();
+      let buffer = '';
+      let accumulated = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex = buffer.indexOf('\n');
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          newlineIndex = buffer.indexOf('\n');
+
+          if (!line) continue;
+
+          let payload: any;
+          try {
+            payload = JSON.parse(line);
+          } catch {
+            // If a partial JSON line slips through, re-buffer it.
+            buffer = line + '\n' + buffer;
+            break;
+          }
+
+          if (payload?.error) {
+            throw new Error(payload.error);
+          }
+
+          const delta = typeof payload?.response === 'string' ? payload.response : '';
+          if (delta) {
+            accumulated += delta;
+            setMessages(prev => {
+              const next = [...prev];
+              if (next[messageIndex] && next[messageIndex].role === 'assistant') {
+                next[messageIndex] = { ...next[messageIndex], content: accumulated, timestamp: new Date() };
+              }
+              return next;
+            });
+          }
+
+          if (payload?.done === true) {
+            break;
+          }
+        }
+      }
+
+      // Store the streamed version in messageVersions
+      const messageId = messageIndex;
+      const existing = messageVersions[messageId] || [];
+      const baseVersions = existing.length > 0 ? existing : [messages[messageIndex].content];
+      const updatedVersions = [...baseVersions, accumulated];
+
+      setMessageVersions({
+        ...messageVersions,
+        [messageId]: updatedVersions
+      });
+      setCurrentMessageVersions({
+        ...currentMessageVersions,
+        [messageId]: updatedVersions.length - 1
+      });
+
+      // Mark conversation as unsaved
+      setLastConversationSaved(false);
     } catch (err) {
+      if (err && typeof err === 'object' && 'name' in err && (err as any).name === 'AbortError') {
+        // Paused by user — keep partial content.
+        return;
+      }
       const errorMessage = err instanceof Error ? err.message : 'Unknown error';
       setError(`Failed to regenerate response: ${errorMessage}`);
       console.error('Error regenerating response:', err);
     } finally {
       setLoading(false);
+      setStreamingMessageIndex(null);
+      generationAbortControllerRef.current = null;
     }
   };
   
@@ -624,147 +1083,191 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   
   // Handle user providing feedback on a message
   const handleMessageFeedback = (messageIndex: number, feedbackType: 'liked' | 'disliked') => {
+    // Update local state for immediate UI feedback
     setFeedbackMessages({
       ...feedbackMessages,
       [messageIndex]: feedbackType
     });
     
-    // Here you could send the feedback to your backend or analytics
+    // Update the message in the messages array to include feedback
+    const updatedMessages = [...messages];
+    updatedMessages[messageIndex] = {
+      ...updatedMessages[messageIndex],
+      feedback: feedbackType
+    };
+    setMessages(updatedMessages);
+    
+    // Mark conversation as unsaved
+    setLastConversationSaved(false);
+    
     console.log(`User ${feedbackType} message at index ${messageIndex}`);
   };
   
   // Handle editing a message
   const startEditingMessage = (messageIndex: number) => {
-    setEditingMessageIndex(messageIndex);
-    // In a full implementation, you'd open a modal or canvas for editing
-    showToast('Editing messages will be available in a future update', 'info');
+    if (editingMessageIndex === messageIndex) {
+      setEditingMessageIndex(null);
+    } else {
+      setEditingMessageIndex(messageIndex);
+    }
   };
 
   // In your handleSubmit function, update to include conversation history
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!input.trim() || !selectedModel) return;
-  
+
+    // If something is already generating, pause it first.
+    if (generationAbortControllerRef.current) {
+      generationAbortControllerRef.current.abort();
+      generationAbortControllerRef.current = null;
+    }
+
+    const promptText = input;
+    const assistantIndex = messages.length + 1;
+
     const userMessage: Message = { 
       role: 'user', 
-      content: input,
+      content: promptText,
       timestamp: new Date() 
     };
-    setMessages((prev) => [...prev, userMessage]);
+
+    // Add a placeholder assistant message so we can stream into it.
+    const placeholderAssistant: Message = {
+      role: 'assistant',
+      content: '',
+      timestamp: new Date()
+    };
+
+    setMessages((prev) => [...prev, userMessage, placeholderAssistant]);
     setInput('');
     setLoading(true);
+    setStreamingMessageIndex(assistantIndex);
     setError(null);
     setLastConversationSaved(false); // Mark as unsaved when new message is added
   
     try {
+      const controller = new AbortController();
+      generationAbortControllerRef.current = controller;
+
       // Get recent conversation history based on settings
       const conversationHistory = useConversationHistory 
         ? truncateConversationHistory(messages, historyLength)
         : [];
       
-      // Create prompt with conversation history if enabled
+      // Create prompt with conversation history and feedback if enabled
       const promptWithHistory = useConversationHistory
-        ? createPromptWithHistory(input, conversationHistory)
-        : input;
+        ? createPromptWithHistoryAndFeedback(promptText, conversationHistory)
+        : promptText;
       
-      const response = await fetch('/api/generate', {
+      const response = await fetch(getOllamaGenerateEndpoint(), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          model: selectedModel,
-          prompt: promptWithHistory,
-          rawPrompt: input, // Original prompt without history
-          system: systemPrompt,
-          options: {
-            temperature,
-            top_p: topP,
-            top_k: topK
-          },
-          suffix: suffixText || undefined,
-          format: formatOption || undefined,
-          template: customTemplate || undefined,
-          think: thinkingEnabled,
-          raw: rawModeEnabled,
-          keep_alive: keepAliveOption,
-          // Include the conversation history in a structured format
-          conversationHistory: useConversationHistory ? conversationHistory.map(msg => ({
-            role: msg.role,
-            content: msg.content
-          })) : []
-        }),
+        signal: controller.signal,
+        body: JSON.stringify(
+          createGenerateRequestBody(
+            selectedModel,
+            promptWithHistory,
+            promptText,
+            conversationHistory
+          )
+        ),
       });
   
-      // Check if response is OK before trying to parse JSON
+      // Check if response is OK before reading the stream
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`API error (${response.status}): ${errorText}`);
       }
-  
-      // Try to parse the JSON with error handling
-      let data;
-      try {
-        data = await response.json();
-      } catch (parseError) {
-        console.error('Error parsing response JSON:', parseError);
-        throw new Error('Invalid JSON response from server');
+
+      if (!response.body) {
+        throw new Error('Streaming response body missing');
       }
-  
-      if (data.error) {
-        setError(data.error);
-      } else {
-        const assistantMessage: Message = {
-          role: 'assistant',
-          content: data.response,
-          timestamp: new Date()
-        };
-        
-        // Update messages with new assistant message
-        setMessages((prev) => {
-          const newMessages = [...prev, assistantMessage];
-          
-          // Store the initial version in messageVersions (index is messages.length because we're adding to prev)
-          const messageId = newMessages.length - 1;
-          
-          // Update message versions in a separate effect to avoid state batching issues
-          setTimeout(() => {
-            setMessageVersions(versions => ({
-              ...versions,
-              [messageId]: [assistantMessage.content]
-            }));
-            
-            setCurrentMessageVersions(currentVersions => ({
-              ...currentVersions,
-              [messageId]: 0
-            }));
-          }, 0);
-          
-          return newMessages;
-        });
-        
-        // Track token usage if available
-        const promptTokens = data.promptTokens || 0;
-        const completionTokens = data.completionTokens || 0;
-        const totalTokens = promptTokens + completionTokens;
-        
-        setPromptTokens(promptTokens);
-        setCompletionTokens(completionTokens);
-        setTotalTokens(totalTokens);
-        
-        // Show token usage briefly
-        setShowTokenUsage(true);
-        setTimeout(() => setShowTokenUsage(false), 5000); // Hide after 5 seconds
-        
-        // Check for auto-save after response received
-        checkAutoSave();
+
+      const decoder = new TextDecoder();
+      const reader = response.body.getReader();
+      let buffer = '';
+      let accumulated = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex = buffer.indexOf('\n');
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          newlineIndex = buffer.indexOf('\n');
+
+          if (!line) continue;
+
+          let payload: any;
+          try {
+            payload = JSON.parse(line);
+          } catch {
+            // Partial JSON line; put it back and wait for the next chunk.
+            buffer = line + '\n' + buffer;
+            break;
+          }
+
+          if (payload?.error) {
+            throw new Error(payload.error);
+          }
+
+          const delta = typeof payload?.response === 'string' ? payload.response : '';
+          if (delta) {
+            accumulated += delta;
+            setMessages(prev => {
+              const next = [...prev];
+              if (next[assistantIndex] && next[assistantIndex].role === 'assistant') {
+                next[assistantIndex] = { ...next[assistantIndex], content: accumulated, timestamp: new Date() };
+              }
+              return next;
+            });
+          }
+
+          if (payload?.done === true) {
+            break;
+          }
+        }
       }
+
+      // Store the final streamed message as version 0
+      setMessageVersions(versions => ({
+        ...versions,
+        [assistantIndex]: [accumulated]
+      }));
+      setCurrentMessageVersions(currentVersions => ({
+        ...currentVersions,
+        [assistantIndex]: 0
+      }));
+
+      // Token usage is approximate in streaming mode (we don't receive exact counts).
+      const promptTokenEstimate = Math.ceil(promptWithHistory.length / 4);
+      const completionTokenEstimate = Math.ceil(accumulated.length / 4);
+      setPromptTokens(promptTokenEstimate);
+      setCompletionTokens(completionTokenEstimate);
+      setTotalTokens(promptTokenEstimate + completionTokenEstimate);
+      setShowTokenUsage(true);
+      setTimeout(() => setShowTokenUsage(false), 5000);
+
+      // Check for auto-save after response received
+      checkAutoSave();
     } catch (err) {
+      if (err && typeof err === 'object' && 'name' in err && (err as any).name === 'AbortError') {
+        // Paused by user — keep partial content.
+        return;
+      }
       const errorMessage = err instanceof Error ? err.message : 'Unknown error';
       setError(`Failed to generate response: ${errorMessage}. Make sure Ollama is running.`);
       console.error('Error generating response:', err);
     } finally {
       setLoading(false);
+      setStreamingMessageIndex(null);
+      generationAbortControllerRef.current = null;
     }
   };
   
@@ -775,33 +1278,31 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     setLastConversationSaved(true); // No content to save, so mark as saved
   };
 
+  // Update the basic toggleDarkMode function too
   const toggleDarkMode = () => {
-    setDarkMode(!darkMode);
-    document.documentElement.classList.toggle('dark');
+    const newTheme = theme === 'light' ? 'dark' : 'light';
+    console.log('Toggling dark mode to:', newTheme);
+    setAppTheme(newTheme);
   };
 
-  // Enhanced function to handle multiple themes
-  const setAppTheme = (newTheme: 'light' | 'dark' | 'obsidian' | 'nature' | 'sunset' | 'custom') => {
-    // Remove all existing theme classes
-    document.documentElement.classList.remove('dark', 'theme-obsidian', 'theme-nature', 'theme-sunset', 'theme-custom');
-
-    // Set the new theme
+  // Enhanced function to handle multiple themes with cleaner implementation
+  const setAppTheme = (newTheme: ThemeType) => {
+    console.log('Setting theme to:', newTheme);
+    
+    // Set the new theme state
     setTheme(newTheme);
 
     // Update darkMode state for backward compatibility
     setDarkMode(newTheme !== 'light');
 
-    // Apply the appropriate class based on the theme
-    if (newTheme === 'dark') {
-      document.documentElement.classList.add('dark');
-    } else if (newTheme !== 'light') {
-      document.documentElement.classList.add(`theme-${newTheme}`);
-    }
+    // Apply the theme using our service - directly sets the data-theme attribute
+    applyTheme(newTheme, newTheme === 'custom' ? customThemeColors : undefined);
+  };
 
-    // Save theme preference
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('silynkr-theme', newTheme);
-    }
+  // Add a function to handle custom theme color changes
+  const handleCustomColorsChange = (colors: CustomThemeColors) => {
+    setCustomThemeColors(colors);
+    applyTheme('custom', colors);
   };
 
   // Function to auto-save after AI responses if enabled
@@ -904,6 +1405,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
       if (data.success && data.conversations) {
         console.log(`Successfully fetched ${data.conversations.length} conversations`);
         setSavedConversations(data.conversations);
+        if (data.source) {
+          setUsingLocalStorage(data.source !== 'mongo');
+        }
       } else {
         console.error('Failed to fetch conversations:', data.error || 'No error message provided');
         showToast('Failed to load conversations: ' + (data.error || 'Unknown error'), 'error');
@@ -926,11 +1430,15 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
   // Function to load a saved conversation
   const loadConversation = (conversation: SavedConversation) => {
-    setMessages(conversation.messages);
+    // Create deep copies of complex objects to avoid reference issues
+    const messagesCopy = JSON.parse(JSON.stringify(conversation.messages || []));
+    
+    setMessages(messagesCopy);
     setSelectedModel(conversation.model);
     setSystemPrompt((conversation as any).systemPrompt || '');
     setTemperature((conversation as any).parameters?.temperature || 0.7);
     setCurrentConversationId(conversation._id);
+    setLastConversationSaved(true);
 
     // Extract folderId correctly regardless of type
     const folderIdValue = getFolderIdString(conversation.folderId);
@@ -939,16 +1447,95 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     // Set tags if available
     setSelectedTags(conversation.tags || []);
 
+    // Reset editing state
+    setEditingMessageIndex(null);
+
     // Clear input
     setInput('');
 
     closeContextMenu();
+    
+    // Show a brief loading toast
+    showToast('Loading conversation...', 'info');
+    
+    // Optionally fetch the latest data from the server for this conversation
+    if (conversation._id) {
+      loadConversationById(conversation._id)
+        .catch(err => console.error('Error refreshing conversation data:', err));
+    }
   };
 
   // Function to create a new conversation
-  const createNewConversation = () => {
+  const createNewConversation = async (options?: { folderId?: string | null }) => {
+    // Reset UI state first
     clearChat();
     setCurrentConversationId(null);
+    setInput('');
+    setEditingMessageIndex(null);
+
+    const targetFolderId = options?.folderId ?? null;
+    setCurrentFolder(targetFolderId);
+    setSelectedTags([]);
+
+    // Ensure we have a model selected
+    const modelToUse = selectedModel || (models.length > 0 ? models[0].name : '');
+    if (!modelToUse) {
+      showToast('Please wait for models to load before creating a new chat.', 'info');
+      return;
+    }
+
+    try {
+      const storedMongoUri = typeof window !== 'undefined'
+        ? localStorage.getItem('MONGODB_URI') || ''
+        : '';
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+
+      if (storedMongoUri) {
+        headers['X-MongoDB-URI'] = storedMongoUri;
+      }
+
+      const conversationPayload = {
+        title: 'New conversation',
+        messages: [],
+        model: modelToUse,
+        systemPrompt,
+        folderId: targetFolderId,
+        tags: [],
+        parameters: {
+          temperature,
+          topP,
+          topK,
+          formatOption,
+          suffixText,
+          customTemplate,
+          keepAlive: keepAliveOption,
+        }
+      };
+
+      const response = await fetch('/api/conversations', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ conversation: conversationPayload })
+      });
+
+      const data = await response.json();
+      if (!response.ok || !data?.success || !data?.conversation) {
+        throw new Error(data?.error || 'Failed to create conversation');
+      }
+
+      const newConversation = data.conversation as SavedConversation;
+      setCurrentConversationId(newConversation._id);
+      setSavedConversations(prev => [newConversation, ...prev.filter(c => c._id !== newConversation._id)]);
+      setLastConversationSaved(true);
+
+      router.push(`/${newConversation._id}`);
+    } catch (err) {
+      console.error('Error creating new conversation:', err);
+      showToast('Failed to start a new chat', 'error');
+    }
   };
 
   // Function to create a new folder
@@ -984,7 +1571,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
         },
         body: JSON.stringify({
           name: newFolderName,
-          color: '#6C63FF', // Default color purple
+          color: 'rgb(var(--primary))', // Use theme variable
           parentId,
           path,
           level
@@ -1021,24 +1608,24 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   // Function to handle context menu
   const handleContextMenu = (e: React.MouseEvent, conversation: SavedConversation) => {
     e.preventDefault();
-    e.stopPropagation();
     setContextMenuPosition({
+      show: true,
       x: e.clientX,
       y: e.clientY,
-      conversation
+      conversation,
+      isRenaming: false
     });
   };
 
   // Function to close context menu
   const closeContextMenu = () => {
     setContextMenuPosition({
+      show: false,
       x: 0,
       y: 0,
-      conversation: null
+      conversation: null,
+      isRenaming: false
     });
-    
-    // Also close color picker when context menu closes
-    // setShowColorPicker(false);
   };
 
   // Function to delete a conversation
@@ -1202,7 +1789,8 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
   useEffect(() => {
     if (conversationId) {
       console.log('Loading conversation from URL param:', conversationId);
-      loadConversationById(conversationId);
+      loadConversationById(conversationId)
+        .catch(err => console.error('Error loading conversation from URL param:', err));
     }
   }, [conversationId]);
 
@@ -1236,8 +1824,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
       console.log('Single conversation API response data:', data);
 
       if (data.success && data.conversation) {
-        // Load the conversation
-        setMessages(data.conversation.messages);
+        // Load the conversation with deep-copied messages to prevent reference issues
+        const conversationMessages = JSON.parse(JSON.stringify(data.conversation.messages));
+        setMessages(conversationMessages);
         setSelectedModel(data.conversation.model);
         setCurrentConversationId(data.conversation._id);
         setLastConversationSaved(true);
@@ -1257,9 +1846,15 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
           }
         }
 
-        // Make sure this conversation is also in savedConversations list
+        // Make sure this conversation is also in savedConversations list with synchronized data
         const exists = savedConversations.some(c => c._id === data.conversation._id);
-        if (!exists) {
+        if (exists) {
+          // Update existing conversation in the list
+          setSavedConversations(prev => 
+            prev.map(c => c._id === data.conversation._id ? data.conversation : c)
+          );
+        } else {
+          // Add new conversation to the list
           setSavedConversations(prev => [data.conversation, ...prev]);
         }
 
@@ -1304,22 +1899,23 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     e.preventDefault();
     e.stopPropagation();
     setFolderContextMenu({
+      show: true,
       x: e.clientX,
       y: e.clientY,
-      folder
+      folder,
+      isRenaming: false
     });
   };
 
   // Close folder context menu
   const closeFolderContextMenu = () => {
     setFolderContextMenu({
+      show: false,
       x: 0,
       y: 0,
-      folder: null
+      folder: null,
+      isRenaming: false
     });
-    
-    // Also close color picker when context menu closes
-    // setShowColorPicker(false);
   };
 
   // Delete folder
@@ -1443,15 +2039,14 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
     // Create a new chat in this folder
     const createNewChatInFolder = () => {
-      createNewConversation();
-      setCurrentFolder(folder._id);
+      createNewConversation({ folderId: folder._id });
       setShowFolderDropdown(false);
     };
 
     return (
       <div className="mb-1">
         <div 
-          className="relative group flex items-center justify-between rounded-md hover:bg-gray-200 dark:hover:bg-gray-700"
+          className="relative group flex items-center justify-between rounded-md hover:bg-muted"
           onDragOver={(e) => handleDragOver(e, folder._id)}
           onDragLeave={handleDragLeave}
           onDrop={(e) => handleDrop(e, folder._id)}
@@ -1462,14 +2057,14 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
               e.preventDefault();
               showFolderContextMenu(e, folder);
             }}
-            className="flex-grow flex items-center justify-between px-2 py-1.5 rounded-md text-gray-700 dark:text-gray-300 cursor-grab"
+            className="flex-grow flex items-center justify-between px-2 py-1.5 rounded-md text-muted-foreground cursor-grab"
             draggable
             onDragStart={(e) => handleDragStart(e, 'folder', folder._id, folder.parentId || null)}
             onDragEnd={handleDragEnd}
           >
             <div className="flex items-center gap-2 text-sm">
               <div style={{ paddingLeft: `${(folder.level || 0) * 12}px` }} className="flex items-center gap-2">
-                <FolderIcon size={14} style={{ color: folder.color || '#6C63FF' }} />
+                <FolderIcon size={14} style={{ color: folder.color || 'rgb(var(--primary))' }} />
                 <span className="truncate">{folder.name}</span>
               </div>
             </div>
@@ -1481,10 +2076,10 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
           {/* Folder dropdown menu */}
           {showFolderDropdown && (
-            <div className="absolute right-0 top-full mt-1 w-48 bg-white dark:bg-gray-800 rounded-md shadow-lg z-50 border border-gray-200 dark:border-gray-700" ref={dropdownRef}>
+            <div className="absolute right-0 top-full mt-1 w-48 bg-card rounded-md shadow-lg z-50 border border-border" ref={dropdownRef}>
             <button
                 onClick={createNewChatInFolder}
-                className="w-full text-left px-4 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
+                className="w-full text-left px-4 py-2 text-sm hover:bg-muted text-card-foreground"
               >
                 New Chat in Folder
             </button>
@@ -1493,7 +2088,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                         setShowFolderDropdown(false);
                   showMoveFolderToFolderDialog(folder);
                       }}
-                className="w-full text-left px-4 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
+                className="w-full text-left px-4 py-2 text-sm hover:bg-muted text-card-foreground"
                     >
                 Move Folder
                     </button>
@@ -1502,7 +2097,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
         </div>
 
         {isExpanded && (
-          <div className="ml-4 pl-2 border-l dark:border-gray-700 space-y-0.5">
+          <div className="ml-4 pl-2 border-l border-border space-y-0.5">
             {/* Child folders */}
             {hasChildren && childFolders[folder._id].map(childFolder => (
               <RenderFolder
@@ -1529,8 +2124,8 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                     key={conv._id}
                     onClick={() => loadConversation(conv)}
                     onContextMenu={(e) => handleContextMenu(e, conv)}
-                    className={`w-full text-left px-2 py-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-xs truncate cursor-grab
-                      ${currentConversationId === conv._id ? 'bg-[#6C63FF]/10 dark:bg-[#5754D2]/30 text-[#6C63FF] dark:text-[#5754D2]' : 'text-gray-600 dark:text-gray-400'}`}
+                    className={`w-full text-left px-2 py-1 rounded-md hover:bg-muted text-xs truncate cursor-grab
+                      ${currentConversationId === conv._id ? 'bg-primary/10 text-primary' : 'text-card-foreground'}`}
                     draggable
                     onDragStart={(e) => handleDragStart(e, 'conversation', conv._id, folder._id)}
                     onDragEnd={handleDragEnd}
@@ -1539,7 +2134,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                   </button>
                 ))
               ) : (
-                <div className="text-xs text-gray-500 dark:text-gray-500 px-2 py-1">
+                <div className="text-xs text-muted-foreground px-2 py-1">
                   No conversations
                 </div>
               );
@@ -1602,7 +2197,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     // Create a temporary input element of type color
     const input = document.createElement('input');
     input.type = 'color';
-    input.value = folder.color || '#6C63FF';
+    input.value = folder.color || 'rgb(var(--primary))';
     
     // Track if the input has been removed
     let inputRemoved = false;
@@ -1853,9 +2448,11 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     // Restore normal appearance
     e.currentTarget.style.opacity = '1';
     
-    // Hide the delete target
+    // Hide the delete target with a longer timeout to ensure it persists long enough
+    setTimeout(() => {
     setShowDeleteTarget(false);
     setDeleteTargetActive(false);
+    }, 300);
     
     console.log('Drag operation ended');
   };
@@ -1865,8 +2462,8 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     e.preventDefault();
     
     // Add visual indication that item can be dropped here
-    e.currentTarget.style.backgroundColor = 'rgba(108, 99, 255, 0.2)';
-    e.currentTarget.style.border = '2px dashed #6C63FF';
+    e.currentTarget.style.backgroundColor = 'rgba(var(--primary), 0.2)';
+    e.currentTarget.style.border = '2px dashed rgb(var(--primary))';
     
     console.log(`Dragging over folder ${folderId}`);
   };
@@ -2117,18 +2714,577 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
     });
   };
 
+  // Add version info to the component
+  const versionInfo = getVersionInfo();
+
+  // Add state for rename input
+  const [renameInputValue, setRenameInputValue] = useState<string>('');
+  const renameInputRef = useRef<HTMLInputElement>(null);
+
+  // Add renameFolder function
+  const renameFolder = async (folderId: string, newName: string) => {
+    if (!newName.trim()) {
+      showToast('Folder name cannot be empty', 'error');
+      return;
+    }
+
+    try {
+      // Optimistic UI update
+      setFolders(prev => 
+        prev.map(f => f._id === folderId ? { ...f, name: newName.trim() } : f)
+      );
+
+      // Save to server
+      const response = await fetch(`/api/folders/${folderId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-MongoDB-URI': mongodbUri || '',
+        },
+        body: JSON.stringify({ name: newName.trim() }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      showToast('Folder renamed successfully', 'success');
+      setFolderContextMenu({ ...folderContextMenu, show: false, isRenaming: false });
+    } catch (error) {
+      console.error('Error renaming folder:', error);
+      showToast(`Error renaming folder: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error');
+    }
+  };
+
+  // Add renameConversation function
+  const renameConversation = async (conversationId: string, newTitle: string) => {
+    if (!newTitle.trim()) {
+      showToast('Conversation title cannot be empty', 'error');
+      return;
+    }
+
+    try {
+      // Find the conversation
+      const conversation = savedConversations.find(c => c._id === conversationId);
+      if (!conversation) {
+        console.error('Conversation not found');
+        return;
+      }
+
+      // Optimistic UI update
+      setSavedConversations(prev => 
+        prev.map(c => c._id === conversationId ? { ...c, title: newTitle.trim() } : c)
+      );
+
+      // Save to server
+      const response = await fetch(`/api/conversations/${conversationId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-mongodb-uri': mongodbUri || '',
+        },
+        body: JSON.stringify({ conversation: { ...conversation, title: newTitle.trim() } }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      showToast('Conversation renamed successfully', 'success');
+      setContextMenuPosition({ ...contextMenuPosition, show: false });
+    } catch (error) {
+      console.error('Error renaming conversation:', error);
+      showToast(`Error renaming conversation: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error');
+    }
+  };
+
+  // Start renaming folder
+  const startRenamingFolder = (folder: Folder) => {
+    setRenameInputValue(folder.name);
+    setFolderContextMenu({ 
+      ...folderContextMenu, 
+      isRenaming: true 
+    });
+    
+    // Focus the input after it's rendered
+    setTimeout(() => {
+      if (renameInputRef.current) {
+        renameInputRef.current.focus();
+        renameInputRef.current.select();
+      }
+    }, 50);
+  };
+
+  // Start renaming conversation
+  const startRenamingConversation = (conversation: SavedConversation) => {
+    setRenameInputValue(conversation.title);
+    setContextMenuPosition({ 
+      ...contextMenuPosition, 
+      isRenaming: true 
+    });
+    
+    // Focus the input after it's rendered
+    setTimeout(() => {
+      if (renameInputRef.current) {
+        renameInputRef.current.focus();
+        renameInputRef.current.select();
+      }
+    }, 50);
+  };
+
+  // First, add a new function to toggle between light and dark mode only
+  const toggleLightDarkMode = () => {
+    const newTheme = theme === 'light' ? 'dark' : 'light';
+    setAppTheme(newTheme);
+  };
+
+  // Add new state variables for theme management
+  const [themeNameInput, setThemeNameInput] = useState<string>('');
+  const [savedThemes, setSavedThemes] = useState<Array<{_id: string, name: string, colors: CustomThemeColors}>>([]);
+  
+  // Add functions for import/export and MongoDB theme operations
+  const exportTheme = () => {
+    exportThemeToFile('custom', customThemeColors);
+  };
+  
+  const importTheme = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    try {
+      showToast('Importing theme...', 'info');
+      console.log('Attempting to import theme from file:', file.name);
+      
+      const theme = await importThemeFromFile(file);
+      console.log('Theme successfully imported:', theme);
+      
+      if (theme && theme.colors) {
+        // Apply the imported theme colors
+        handleCustomColorsChange(theme.colors);
+        showToast(`Theme "${theme.name}" imported successfully`, 'success');
+      } else {
+        throw new Error('Invalid theme structure');
+      }
+    } catch (error: any) {
+      console.error('Import theme error:', error);
+      showToast(`Failed to import theme: ${error.message || 'Unknown error'}`, 'error');
+    } finally {
+      // Reset input value to allow selecting the same file again
+      event.target.value = '';
+    }
+  };
+  
+  // Function to save theme to MongoDB
+  const saveThemeToMongoDB = async () => {
+    if (!themeNameInput.trim()) {
+      showToast('Please enter a theme name', 'info');
+      return;
+    }
+
+    try {
+      // Get MongoDB URI from localStorage if available
+      const storedMongoUri = typeof window !== 'undefined'
+        ? localStorage.getItem('MONGODB_URI') || ''
+        : '';
+      
+      const response = await fetch('/api/themes', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-MongoDB-URI': storedMongoUri
+        },
+        body: JSON.stringify({
+          name: themeNameInput,
+          colors: customThemeColors
+        }),
+      });
+
+      const data = await response.json();
+      
+      if (data.success && data.theme) {
+        // Add the new theme to the list
+        setSavedThemes(prevThemes => [data.theme, ...prevThemes]);
+        setThemeNameInput(''); // Clear input
+        showToast(`Theme "${themeNameInput}" saved successfully`, 'success');
+      } else {
+        throw new Error(data.error || 'Failed to save theme');
+      }
+    } catch (error) {
+      console.error('Error saving theme:', error);
+      showToast('Failed to save theme', 'error');
+    }
+  };
+  
+  // Function to load saved theme
+  const loadSavedTheme = (theme: {_id: string, name: string, colors: CustomThemeColors}) => {
+    handleCustomColorsChange(theme.colors);
+    setAppTheme('custom');
+    showToast(`Theme "${theme.name}" loaded successfully`, 'success');
+  };
+  
+  // Function to delete saved theme
+  const deleteSavedTheme = async (themeId: string) => {
+    try {
+      // Get MongoDB URI from localStorage if available
+      const storedMongoUri = typeof window !== 'undefined'
+        ? localStorage.getItem('MONGODB_URI') || ''
+        : '';
+      
+      const response = await fetch(`/api/themes/${themeId}`, {
+        method: 'DELETE',
+        headers: {
+          'X-MongoDB-URI': storedMongoUri
+        }
+      });
+      
+      const data = await response.json();
+      
+      if (data.success) {
+        // Remove the theme from the list
+        setSavedThemes(prevThemes => prevThemes.filter(theme => theme._id !== themeId));
+        showToast('Theme deleted successfully', 'success');
+      } else {
+        throw new Error(data.error || 'Failed to delete theme');
+      }
+    } catch (error) {
+      console.error('Error deleting theme:', error);
+      showToast('Failed to delete theme', 'error');
+    }
+  };
+  
+  // Add effect to fetch saved themes
+  useEffect(() => {
+    const fetchSavedThemes = async () => {
+      try {
+        // Get MongoDB URI from localStorage if available
+        const storedMongoUri = typeof window !== 'undefined'
+          ? localStorage.getItem('MONGODB_URI') || ''
+          : '';
+        
+        const response = await fetch('/api/themes', {
+          headers: {
+            'X-MongoDB-URI': storedMongoUri
+          }
+        });
+        
+        const data = await response.json();
+        
+        if (data.success && data.themes) {
+          setSavedThemes(data.themes);
+        }
+      } catch (error) {
+        console.error('Error fetching saved themes:', error);
+      }
+    };
+    
+    fetchSavedThemes();
+  }, []);
+  
+  // Add UI density state
+  const [uiDensity, setUiDensity] = useState<'comfortable' | 'compact'>('comfortable');
+  // Add font size state (1-5 scale: 1=small, 3=medium, 5=large)
+  const [fontSize, setFontSize] = useState<number>(3);
+
+  // Load UI preferences from localStorage on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      // Load UI density preference
+      const savedDensity = localStorage.getItem('silynkr-ui-density');
+      if (savedDensity === 'compact' || savedDensity === 'comfortable') {
+        setUiDensity(savedDensity);
+      }
+      
+      // Load font size preference
+      const savedFontSize = localStorage.getItem('silynkr-font-size');
+      if (savedFontSize) {
+        const size = parseInt(savedFontSize, 10);
+        if (!isNaN(size) && size >= 1 && size <= 5) {
+          setFontSize(size);
+        }
+      }
+    }
+  }, []);
+
+  // Save UI density preference
+  const setUiDensityPreference = (density: 'comfortable' | 'compact') => {
+    setUiDensity(density);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('silynkr-ui-density', density);
+    }
+  };
+
+  // Save font size preference
+  const setFontSizePreference = (size: number) => {
+    setFontSize(size);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('silynkr-font-size', size.toString());
+    }
+    
+    // Apply the font size to the root element
+    document.documentElement.style.fontSize = getFontSizeValue(size);
+  };
+  
+  // Helper to get CSS font-size value based on size setting
+  const getFontSizeValue = (size: number): string => {
+    switch (size) {
+      case 1: return '14px'; // Small
+      case 2: return '15px'; // Medium-small
+      case 3: return '16px'; // Medium (default)
+      case 4: return '18px'; // Medium-large
+      case 5: return '20px'; // Large
+      default: return '16px'; // Default
+    }
+  };
+  
+  // Apply font size on component mount
+  useEffect(() => {
+    document.documentElement.style.fontSize = getFontSizeValue(fontSize);
+    
+    // Add a class for UI density
+    if (uiDensity === 'compact') {
+      document.documentElement.classList.add('compact-ui');
+    } else {
+      document.documentElement.classList.remove('compact-ui');
+    }
+    
+    return () => {
+      // Clean up on unmount
+      document.documentElement.style.fontSize = '';
+      document.documentElement.classList.remove('compact-ui');
+    };
+  }, [fontSize, uiDensity]);
+
+  // Add a new function to handle saving edited message
+  const saveEditedMessage = async (messageIndex: number, newContent: string, jsonContent?: any) => {
+    if (messageIndex < 0 || messageIndex >= messages.length) {
+      return;
+    }
+
+    // Create a new message with the edited content
+    const updatedMessage: Message = {
+      ...messages[messageIndex],
+      content: newContent,
+      jsonContent: jsonContent || null, // Store JSON content for better LLM processing
+      editedAt: new Date()
+    };
+
+    // Update the messages array in state
+    const updatedMessages = [...messages];
+    updatedMessages[messageIndex] = updatedMessage;
+    setMessages(updatedMessages);
+
+    // Exit editing mode
+    setEditingMessageIndex(null);
+
+    // Mark conversation as unsaved
+    setLastConversationSaved(false);
+
+    // Update the savedConversations list with the updated message for immediate UI update
+    if (currentConversationId) {
+      setSavedConversations(prevConversations => 
+        prevConversations.map(conv => {
+          if (conv._id === currentConversationId) {
+            // Create a new conversation object with updated messages
+            return {
+              ...conv,
+              messages: updatedMessages,
+              updatedAt: new Date()
+            };
+          }
+          return conv;
+        })
+      );
+    }
+
+    // Always save changes immediately when editing a message
+    try {
+      // Get MongoDB URI from localStorage if available
+      const storedMongoUri = typeof window !== 'undefined'
+        ? localStorage.getItem('MONGODB_URI') || ''
+        : '';
+
+      // Prepare the updated conversation with efficient message structure
+      const conversation = {
+        messages: updatedMessages.map(msg => ({
+          role: msg.role,
+          content: msg.content,
+          jsonContent: msg.jsonContent || undefined,
+          timestamp: msg.timestamp,
+          editedAt: msg.editedAt || undefined,
+          comments: msg.comments || [] // Preserve comments
+        }))
+      };
+
+      // Use PATCH method to update only the messages field
+      const response = await fetch(`/api/conversations/${currentConversationId}/messages`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-MongoDB-URI': storedMongoUri
+        },
+        body: JSON.stringify({ messages: conversation.messages }),
+      });
+
+      if (response.ok) {
+        setLastConversationSaved(true);
+        // Show a success toast to indicate the message was saved
+        showToast('Message updated successfully', 'success');
+      } else {
+        throw new Error('Failed to save edited message');
+      }
+    } catch (error) {
+      console.error('Error saving edited message:', error);
+      showToast('Failed to save edited message. Changes are in memory only.', 'error');
+    }
+  };
+
+  // Add effect to ensure delete target is hidden after any drag operation
+  useEffect(() => {
+    const handleGlobalDragEnd = () => {
+      // Make sure the delete target is hidden when drag ends anywhere
+      setTimeout(() => {
+        setShowDeleteTarget(false);
+        setDeleteTargetActive(false);
+      }, 100);
+    };
+
+    const handleGlobalDrop = (e: DragEvent) => {
+      // When something is dropped anywhere in the document
+      setTimeout(() => {
+        setShowDeleteTarget(false);
+        setDeleteTargetActive(false);
+      }, 100);
+    };
+
+    // Add event listener to global document
+    document.addEventListener('dragend', handleGlobalDragEnd);
+    document.addEventListener('drop', handleGlobalDrop);
+    
+    // Clean up
+    return () => {
+      document.removeEventListener('dragend', handleGlobalDragEnd);
+      document.removeEventListener('drop', handleGlobalDrop);
+    };
+  }, []);
+
+  // Add layout effect to ensure delete target is hidden immediately when drag operations end
+  useLayoutEffect(() => {
+    if (!showDeleteTarget) {
+      // Force-hide the delete target when showDeleteTarget is false
+      const deleteTargets = document.querySelectorAll('.delete-target');
+      deleteTargets.forEach(target => {
+        (target as HTMLElement).style.display = 'none';
+      });
+    }
+  }, [showDeleteTarget]);
+
+  // Process command line arguments
+
+  // Add a function to handle adding a comment to a message
+  const addCommentToMessage = (messageIndex: number, text: string, color: string) => {
+    if (messageIndex < 0 || messageIndex >= messages.length) {
+      return;
+    }
+
+    const updatedMessages = [...messages];
+    
+    // Create a new comment
+    const newComment = {
+      id: crypto.randomUUID(), // Generate a unique ID
+      text,
+      color,
+      createdAt: new Date()
+    };
+    
+    // Add the comment to the message
+    if (!updatedMessages[messageIndex].comments) {
+      updatedMessages[messageIndex].comments = [];
+    }
+    
+    updatedMessages[messageIndex].comments?.push(newComment);
+    setMessages(updatedMessages);
+    
+    // Show a success toast
+    showToast('Comment added successfully', 'success');
+    
+    // Force MongoDB URI from localStorage if available
+    const storedMongoUri = typeof window !== 'undefined'
+      ? localStorage.getItem('MONGODB_URI') || ''
+      : '';
+      
+    // Store MongoDB URI in localStorage to ensure it's used for persistence
+    if (storedMongoUri) {
+      localStorage.setItem('MONGODB_URI', storedMongoUri);
+    } else {
+      // If no MongoDB URI is set, use a default one for local development
+      localStorage.setItem('MONGODB_URI', 'mongodb://localhost:27017/silynkr');
+    }
+    
+    // If the conversation is saved, update it
+    if (currentConversationId) {
+      // Mark conversation as unsaved
+      setLastConversationSaved(false);
+      
+      // Save the conversation with the new comment
+      saveConversation();
+    }
+  };
+
+  // Add a function to handle deleting a comment from a message
+  const deleteCommentFromMessage = (messageIndex: number, commentId: string) => {
+    if (messageIndex < 0 || messageIndex >= messages.length) {
+      return;
+    }
+    
+    const updatedMessages = [...messages];
+    
+    // Filter out the comment to delete
+    if (updatedMessages[messageIndex].comments) {
+      updatedMessages[messageIndex].comments = updatedMessages[messageIndex].comments?.filter(
+        comment => comment.id !== commentId
+      );
+    }
+    
+    setMessages(updatedMessages);
+    
+    // Show a success toast
+    showToast('Comment deleted successfully', 'success');
+    
+    // Force MongoDB URI from localStorage if available
+    const storedMongoUri = typeof window !== 'undefined'
+      ? localStorage.getItem('MONGODB_URI') || ''
+      : '';
+      
+    // Store MongoDB URI in localStorage to ensure it's used for persistence
+    if (storedMongoUri) {
+      localStorage.setItem('MONGODB_URI', storedMongoUri);
+    } else {
+      // If no MongoDB URI is set, use a default one for local development
+      localStorage.setItem('MONGODB_URI', 'mongodb://localhost:27017/silynkr');
+    }
+    
+    // If the conversation is saved, update it
+    if (currentConversationId) {
+      // Mark conversation as unsaved
+      setLastConversationSaved(false);
+      
+      // Save the conversation with the deleted comment
+      saveConversation();
+    }
+  };
+
   return (
-    <div className={`flex h-screen flex-col ${darkMode ? 'dark' : ''}`}>
+    <div className="flex h-screen flex-col">
       {/* New version notification */}
       {showVersionNotification && (
-        <div className="bg-[#6C63FF]/5 dark:bg-[#5754D2]/20 border-b border-[#6C63FF]/10 dark:border-[#5754D2]/30">
+        <div className="bg-primary/5 border-b border-primary/10">
           <div className="max-w-7xl mx-auto py-2 px-3 sm:px-6 lg:px-8">
             <div className="flex items-center justify-between flex-wrap">
               <div className="flex items-center">
-                <span className="flex p-1 rounded-lg bg-[#6C63FF]/10 dark:bg-[#5754D2]/30">
-                  <AlertCircle className="h-5 w-5 text-[#6C63FF] dark:text-[#5754D2]" aria-hidden="true" />
+                <span className="flex p-1 rounded-lg bg-primary/10">
+                  <AlertCircle className="h-5 w-5 text-primary" aria-hidden="true" />
                 </span>
-                <p className="ml-3 font-medium text-[#6C63FF] dark:text-[#5754D2] truncate text-sm">
+                <p className="ml-3 font-medium text-primary truncate text-sm">
                   <span>
                     New beta version 1.2.0 released! Try the resizable sidebar and improved folder organization with drag and drop.
                   </span>
@@ -2138,7 +3294,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                 <button
                   type="button"
                   onClick={() => setShowVersionNotification(false)}
-                  className="p-1.5 rounded-md text-[#6C63FF] dark:text-[#5754D2] hover:bg-[#6C63FF]/10 dark:hover:bg-[#5754D2]/30 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#6C63FF]"
+                  className="p-1.5 rounded-md text-primary hover:bg-primary/10 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
                 >
                   <span className="sr-only">Dismiss</span>
                   <X className="h-4 w-4" aria-hidden="true" />
@@ -2154,7 +3310,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
         {/* Delete target */}
         {showDeleteTarget && (
           <div 
-            className="fixed bottom-8 right-8 z-50 flex items-center justify-center transition-all duration-200"
+            className="fixed bottom-8 right-8 z-50 flex items-center justify-center transition-all duration-200 delete-target"
             style={{
               width: deleteTargetActive ? '60px' : '50px',
               height: deleteTargetActive ? '60px' : '50px',
@@ -2185,8 +3341,8 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
         
         {/* Custom Delete Confirmation Dialog */}
         {confirmDelete.show && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm bg-black/30">
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl p-6 max-w-md w-full transform transition-all animate-fade-in-up border border-gray-200 dark:border-gray-700">
+          <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm bg-black/30 dark:bg-white/10">
+            <div className="bg-card rounded-lg shadow-xl p-6 max-w-md w-full transform transition-all animate-fade-in-up border border-border">
               <div className="flex items-center justify-center mb-4">
                 <div className="w-12 h-12 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
                   <svg 
@@ -2206,11 +3362,11 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                 </div>
               </div>
               
-              <h3 className="text-lg font-medium text-gray-900 dark:text-white text-center mb-2">
+              <h3 className="text-lg font-medium text-foreground text-center mb-2">
                 Confirm Deletion
               </h3>
               
-              <p className="text-center text-gray-600 dark:text-gray-300 mb-6">
+              <p className="text-center text-card-foreground mb-6">
                 {confirmDelete.type === 'conversation' 
                   ? `Are you sure you want to delete the conversation "${confirmDelete.title}"?`
                   : `Are you sure you want to delete the folder "${confirmDelete.title}" and move all its conversations to root?`
@@ -2220,7 +3376,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
               <div className="flex justify-center space-x-4">
                 <button
                   onClick={handleCancelDelete}
-                  className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                  className="px-4 py-2 border border-border rounded-md text-sm font-medium text-card-foreground hover:bg-muted transition-colors"
                 >
                   Cancel
                 </button>
@@ -2278,31 +3434,57 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
       {/* Sidebar */}
         <div 
           ref={sidebarRef}
-          className={`${sidebarOpen ? '' : 'w-0 opacity-0'} bg-gray-50 dark:bg-gray-800 border-r dark:border-gray-700 transition-opacity duration-300 flex flex-col relative`}
+          className={`${sidebarOpen ? '' : 'w-0 opacity-0'} bg-card border-r border-border transition-opacity duration-300 flex flex-col relative`}
           style={{ width: sidebarOpen ? `${sidebarWidth}px` : '0px' }}
         >
-          <div className="p-4 border-b dark:border-gray-700 flex items-center justify-between">
+          <div className="p-4 border-b border-border flex items-center justify-between">
             <div className="flex items-center">
+              {/* Always show logo in sidebar when open */}
+              {sidebarOpen && (
               <Image
                 src="/Horizontal-SiLynkr-Logo.png"
                 alt="SiLynkr Logo"
-                width={140}
-                height={28}
+                  width={120}
+                  height={24}
+                  className="h-auto"
+                />
+              )}
+              
+              {!sidebarOpen && (
+                <div className="flex items-center">
+                  <button 
+                    onClick={() => setSidebarOpen(true)} 
+                    className="p-3 mr-3 rounded-md hover:bg-muted flex items-center justify-center min-w-[44px] min-h-[44px] touch-manipulation"
+                    aria-label="Open sidebar"
+                  >
+                    <Menu size={22} className="text-muted-foreground" />
+                  </button>
+                  <Image
+                    src="/Horizontal-SiLynkr-Logo.png"
+                    alt="SiLynkr Logo"
+                    width={120}
+                    height={24}
                 className="h-auto"
               />
             </div>
-            <button onClick={() => setSidebarOpen(false)} className="p-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700">
-              <X size={18} className="text-gray-600 dark:text-gray-300" />
+              )}
+            </div>
+            <button 
+              onClick={() => setSidebarOpen(false)} 
+              className="p-3 rounded-md hover:bg-muted flex items-center justify-center min-w-[44px] min-h-[44px] touch-manipulation"
+              aria-label="Close sidebar"
+            >
+              <X size={22} className="text-muted-foreground" />
             </button>
           </div>
         
           <div className="flex-1 overflow-y-auto px-3 space-y-2">
             {/* Recent Chats Section */}
             <div className="flex justify-between items-center mb-1">
-              <div className="text-sm font-medium text-gray-500 dark:text-gray-400">Recent Chats</div>
+              <div className="text-sm font-medium text-muted-foreground">Recent Chats</div>
               <button
                 onClick={createNewConversation}
-                className="text-xs text-[#6C63FF] dark:text-[#5754D2] hover:underline"
+                className="text-xs text-primary hover:underline"
               >
                 + New
               </button>
@@ -2311,9 +3493,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
             {loadingConversations ? (
               <div className="py-2 flex items-center justify-center">
                 <div className="animate-pulse flex space-x-2">
-                  <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                  <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                  <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
+                  <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                  <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                  <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
                 </div>
               </div>
             ) : savedConversations.length > 0 ? (
@@ -2327,8 +3509,8 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                       key={conv._id}
                       onClick={() => loadConversation(conv)}
                       onContextMenu={(e) => handleContextMenu(e, conv)}
-                      className={`w-full flex items-center text-left px-2 py-1.5 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 cursor-grab
-                        ${currentConversationId === conv._id ? 'bg-[#6C63FF]/10 dark:bg-[#5754D2]/30 text-[#6C63FF] dark:text-[#5754D2]' : 'text-gray-700 dark:text-gray-300'}`}
+                      className={`w-full flex items-center text-left px-2 py-1.5 rounded-md hover:bg-muted cursor-grab
+                        ${currentConversationId === conv._id ? 'bg-primary/10 text-primary' : 'text-card-foreground'}`}
                       draggable
                       onDragStart={(e) => handleDragStart(e, 'conversation', conv._id, null)}
                       onDragEnd={handleDragEnd}
@@ -2340,16 +3522,16 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                 }
               </div>
             ) : (
-              <div className="text-xs italic text-gray-500 dark:text-gray-500 px-1 py-1">
+              <div className="text-xs italic text-muted-foreground px-1 py-1">
                 No saved conversations
               </div>
             )}
             {/* Folders Section */}
             <div className="flex justify-between items-center mb-1 mt-4">
-              <div className="text-sm font-medium text-gray-500 dark:text-gray-400">Folders</div>
+              <div className="text-sm font-medium text-muted-foreground">Folders</div>
               <button
                 onClick={() => setShowNewFolderInput(!showNewFolderInput)}
-                className="text-xs text-[#6C63FF] dark:text-[#5754D2] hover:underline"
+                className="text-xs text-primary hover:underline"
               >
                 + New
               </button>
@@ -2362,7 +3544,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                   value={newFolderName}
                   onChange={(e) => setNewFolderName(e.target.value)}
                   placeholder="Folder name"
-                  className="w-full text-sm border border-gray-300 dark:border-gray-600 rounded-l-md p-1 bg-white dark:bg-gray-700 text-gray-900 dark:text-white pr-16"
+                  className="w-full text-sm border border-border rounded-l-md p-1 bg-card text-card-foreground pr-16"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') createFolder();
                     if (e.key === 'Escape') {
@@ -2374,7 +3556,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                 />
                 <button
                   onClick={() => createFolder()}
-                  className="absolute right-0 top-0 bottom-0 bg-[#6C63FF] hover:bg-[#5754D2] text-white px-2 rounded-r-md text-xs whitespace-nowrap"
+                  className="absolute right-0 top-0 bottom-0 bg-primary hover:bg-primary-hover text-primary-foreground px-2 rounded-r-md text-xs whitespace-nowrap"
                 >
                   Create
                 </button>
@@ -2384,9 +3566,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
             {loadingConversations ? (
               <div className="py-2 flex items-center justify-center">
                 <div className="animate-pulse flex space-x-2">
-                  <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                  <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                  <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
+                  <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                  <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                  <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
                 </div>
               </div>
             ) : folders.length > 0 ? (
@@ -2404,7 +3586,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                 })()}
               </div>
             ) : (
-              <div className="text-xs italic text-gray-500 dark:text-gray-500 px-1 py-1">
+              <div className="text-xs italic text-muted-foreground px-1 py-1">
                 No folders yet
               </div>
             )}
@@ -2412,23 +3594,23 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
         </div>
         
-          <div className="p-3 border-t dark:border-gray-700">
-            <button className="w-full flex items-center gap-2 py-2 px-3 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300" onClick={() => setShowSettings(true)}>
+          <div className="p-3 border-t border-border">
+            <button className="w-full flex items-center gap-2 py-2 px-3 rounded-md hover:bg-muted text-card-foreground" onClick={() => setShowSettings(true)}>
               <Settings size={16} />
               <span>Settings</span>
             </button>
-            <button className="w-full flex items-center gap-2 py-2 px-3 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300 " onClick={saveConversation}>
+            <button className="w-full flex items-center gap-2 py-2 px-3 rounded-md hover:bg-muted text-card-foreground" onClick={saveConversation}>
               <FolderIcon size={16} />
               <span>Save Conversation</span>
             </button>
-            <button className="w-full flex items-center gap-2 py-2 px-3 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300" onClick={shareConversation}>
+            <button className="w-full flex items-center gap-2 py-2 px-3 rounded-md hover:bg-muted text-card-foreground" onClick={shareConversation}>
               <Share size={16} />
               <span>{isShared ? 'Unshare Conversation' : 'Share Conversation'}</span>
             </button>
-            <div className="text-center text-xs text-gray-500 dark:text-gray-400">
+            <div className="text-center text-xs text-muted-foreground">
               <div className="flex flex-col items-center justify-center gap-1">
                 <div>
-                  SiLynkr {getVersionString()} by <a href="https://si4k.me" target="_blank" rel="noopener noreferrer" className="underline text-[#6C63FF] dark:text-[#5754D2]hover:text-[#5754D2] ">Si4k</a>
+                  SiLynkr {versionInfo.displayVersion} by <a href="https://si4k.me" target="_blank" rel="noopener noreferrer" className="underline text-primary hover:text-primary-hover">Si4k</a>
                 </div>
               </div>
             </div>
@@ -2438,7 +3620,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
           {sidebarOpen && (
             <div
               ref={resizeRef}
-              className="absolute top-0 right-0 h-full w-1 cursor-ew-resize hover:bg-[#6C63FF] hover:w-1 z-10 group"
+              className="absolute top-0 right-0 h-full w-1 cursor-ew-resize hover:bg-primary hover:w-1 z-10 group"
               onMouseDown={startResizing}
             >
               <div className="invisible group-hover:visible absolute top-1/2 right-0 w-4 h-8 -translate-y-1/2 translate-x-1/2 flex items-center justify-center bg-[#6C63FF] rounded-full">
@@ -2453,12 +3635,16 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
         {/* Main Content - Center properly when sidebar is closed */}
         <div className={`flex-1 flex flex-col transition-all duration-300 ${!sidebarOpen ? 'ml-0 w-full' : ''}`}>
         {/* Header */}
-          <div className="bg-white dark:bg-gray-800 shadow-sm border-b dark:border-gray-700 py-2">
+          <div className="bg-card shadow-sm border-b border-border py-2">
             <div className={`${!sidebarOpen ? 'container mx-auto px-4' : 'px-4'} flex items-center justify-between`}>
             {!sidebarOpen && (
                 <div className="flex items-center">
-              <button onClick={() => setSidebarOpen(true)} className="p-2 mr-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700">
-                <Menu size={20} className="text-gray-600 dark:text-gray-300" />
+              <button 
+                onClick={() => setSidebarOpen(true)} 
+                className="p-3 mr-3 rounded-md hover:bg-muted flex items-center justify-center min-w-[44px] min-h-[44px] touch-manipulation"
+                aria-label="Open sidebar"
+              >
+                <Menu size={22} className="text-muted-foreground" />
               </button>
                   <Image
                     src="/Horizontal-SiLynkr-Logo.png"
@@ -2476,14 +3662,14 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                   id="model-select"
                   value={selectedModel}
                   onChange={(e) => setSelectedModel(e.target.value)}
-                  className="w-full p-2 pl-4 pr-10 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-[#6C63FF] focus:border-transparent"
+                  className="w-full p-2 themed-select focus:ring-2 focus:ring-primary"
                   disabled={loading}
                 >
                   {models.length === 0 && (
                     <option value="">No models available</option>
                   )}
                   {models.map((model) => (
-                    <option key={model.name} value={model.name}>
+                    <option key={model.name} value={model.name} className="py-2 bg-card text-card-foreground">
                       {model.name}
                     </option>
                   ))}
@@ -2491,33 +3677,40 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
               </div>
                 )}
                 {showSettings && (
-                  <h1 className="text-xl font-medium text-gray-900 dark:text-white">SiLynkr Settings</h1>
+                  <h1 className="text-xl font-medium text-foreground">SiLynkr Settings</h1>
                 )}
             </div>
             
+            <div>
             <button 
-                onClick={() => setAppTheme(theme === 'light' ? 'dark' : 'light')}
-                className="p-2 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
-            >
-                {theme === 'light' ? <Moon size={20} /> : <Sun size={20} />}
+                onClick={toggleLightDarkMode}
+                className="p-2 rounded-md hover:bg-muted transition-colors"
+                aria-label={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
+              >
+                {theme === 'light' ? (
+                  <Moon size={20} className="text-foreground" />
+                ) : (
+                  <Sun size={20} className="text-foreground" />
+                )}
             </button>
+            </div>
           </div>
         </div>
         
         {/* Chat Area */}
-        <div className="flex-1 overflow-hidden bg-gray-50 dark:bg-gray-900 flex flex-col">
+        <div className="flex-1 overflow-hidden bg-background flex flex-col">
             {showSettings ? (
               /* Settings View */
               <div className="flex-1 overflow-y-auto">
                 <div className={`${!sidebarOpen ? 'container mx-auto px-4' : ''} max-w-3xl mx-auto py-8 px-4`}>
                   <div className="flex items-center justify-between mb-6">
-                    <h2 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
+                    <h2 className="text-2xl font-bold text-foreground flex items-center gap-2">
                       <Settings size={24} />
                       Settings
                     </h2>
                     <button
                       onClick={() => setShowSettings(false)}
-                      className="p-1 rounded-md hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-600 dark:text-gray-300"
+                      className="p-1 rounded-md hover:bg-muted text-muted-foreground"
                     >
                       <X size={20} />
                     </button>
@@ -2526,28 +3719,28 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                   <div className="flex flex-col md:flex-row gap-6">
                     {/* Settings navigation */}
                     <div className="md:w-64 shrink-0">
-                      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700">
+                      <div className="bg-card rounded-lg shadow-sm border border-border">
                         {/* Settings navigation tabs */}
                         <button
-                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'general' ? 'border-[#6C63FF] bg-[#6C63FF]/5 dark:bg-[#5754D2]/20 text-[#6C63FF] dark:text-[#5754D2]' : 'border-transparent hover:bg-gray-50 dark:hover:bg-gray-700'}`}
+                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'general' ? 'border-primary bg-primary/5 text-primary' : 'border-transparent hover:bg-muted'}`}
                           onClick={() => setSettingsView('general')}
                         >
                           General
                         </button>
                         <button
-                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'advanced' ? 'border-[#6C63FF] bg-[#6C63FF]/5 dark:bg-[#5754D2]/20 text-[#6C63FF] dark:text-[#5754D2]' : 'border-transparent hover:bg-gray-50 dark:hover:bg-gray-700'}`}
+                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'advanced' ? 'border-primary bg-primary/5 text-primary' : 'border-transparent hover:bg-muted'}`}
                           onClick={() => setSettingsView('advanced')}
                         >
                           Advanced Options
                         </button>
                         <button
-                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'appearance' ? 'border-[#6C63FF] bg-[#6C63FF]/5 dark:bg-[#5754D2]/20 text-[#6C63FF] dark:text-[#5754D2]' : 'border-transparent hover:bg-gray-50 dark:hover:bg-gray-700'}`}
+                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'appearance' ? 'border-primary bg-primary/5 text-primary' : 'border-transparent hover:bg-muted'}`}
                           onClick={() => setSettingsView('appearance')}
                         >
                           Appearance
                         </button>
                         <button
-                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'updates' ? 'border-[#6C63FF] bg-[#6C63FF]/5 dark:bg-[#5754D2]/20 text-[#6C63FF] dark:text-[#5754D2]' : 'border-transparent hover:bg-gray-50 dark:hover:bg-gray-700'}`}
+                          className={`w-full text-left px-4 py-3 border-l-4 ${settingsView === 'updates' ? 'border-primary bg-primary/5 text-primary' : 'border-transparent hover:bg-muted'}`}
                           onClick={() => setSettingsView('updates')}
                         >
                           Updates
@@ -2556,15 +3749,15 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
           </div>
           
                     {/* Settings content */}
-                    <div className="flex-1 bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 p-5">
+                    <div className="flex-1 bg-card rounded-lg shadow-sm border border-border p-5">
                       {/* General Settings */}
                       {settingsView === 'general' && (
                         <div className="space-y-6">
-                          <h3 className="text-lg font-medium text-gray-900 dark:text-white">General Settings</h3>
+                          <h3 className="text-lg font-medium text-foreground">General Settings</h3>
 
                           {/* System Prompt */}
                 <div>
-                            <label htmlFor="systemPrompt" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="systemPrompt" className="block text-sm font-medium text-foreground mb-1">
                     System Prompt
                   </label>
                   <textarea
@@ -2572,17 +3765,17 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                               rows={3}
                     value={systemPrompt}
                     onChange={(e) => setSystemPrompt(e.target.value)}
-                    className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                    className="w-full p-2 border border-border rounded-md bg-card text-card-foreground"
                               placeholder="Optional system prompt to guide the assistant's responses"
                   />
-                            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+                            <p className="mt-1 text-sm text-muted-foreground">
                               System prompt provides context to the model about how it should respond.
                             </p>
                 </div>
                 
                           {/* MongoDB Connection */}
                 <div>
-                            <label htmlFor="mongodb-uri" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="mongodb-uri" className="block text-sm font-medium text-foreground mb-1">
                               MongoDB Connection URI
                   </label>
                             <div className="flex gap-2">
@@ -2591,17 +3784,17 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                                 type="text"
                                 value={mongodbUri}
                                 onChange={(e) => setMongodbUri(e.target.value)}
-                                className="flex-1 p-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                                className="flex-1 p-2 border border-border rounded-md bg-card text-card-foreground"
                                 placeholder="mongodb://username:password@host:port/database"
                               />
                               <button
-                                className="px-3 py-2 bg-[#6C63FF] hover:bg-[#5754D2] text-white rounded-md text-sm"
+                                className="px-3 py-2 bg-primary hover:bg-primary-hover text-primary-foreground rounded-md text-sm"
                                 onClick={saveMongoDbUri}
                               >
                                 Save
                               </button>
                             </div>
-                            <p className="mt-1 text-sm text-gray-500 dark:text-gray-400 flex items-center gap-2">
+                            <p className="mt-1 text-sm text-muted-foreground flex items-center gap-2">
                               <span>{usingLocalStorage ? 'Using local storage' : 'Connected to MongoDB'}</span>
                               <span className={`w-2 h-2 rounded-full ${usingLocalStorage ? 'bg-amber-500' : 'bg-green-500'}`}></span>
                             </p>
@@ -2615,9 +3808,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                                 type="checkbox"
                                 checked={autoSave}
                                 onChange={(e) => setAutoSave(e.target.checked)}
-                                className="h-4 w-4 text-[#6C63FF] focus:ring-[#5754D2] border-gray-300 rounded"
+                                className="h-4 w-4 text-primary focus:ring-primary border-border rounded"
                               />
-                              <label htmlFor="autosave" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
+                              <label htmlFor="autosave" className="ml-2 block text-sm text-foreground">
                                 Auto-save conversations after each response
                               </label>
                             </div>
@@ -2628,13 +3821,13 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                       {/* Advanced Settings */}
                       {settingsView === 'advanced' && (
                         <div className="space-y-6">
-                          <h3 className="text-lg font-medium text-gray-900 dark:text-white">Advanced Options</h3>
+                          <h3 className="text-lg font-medium text-foreground">Advanced Options</h3>
 
                           {/* Temperature */}
                           <div>
-                            <label htmlFor="temperature" className="flex justify-between text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="temperature" className="flex justify-between text-sm font-medium text-foreground mb-1">
                               <span>Temperature</span>
-                              <span className="text-gray-500 dark:text-gray-400">{temperature}</span>
+                              <span className="text-muted-foreground">{temperature}</span>
                             </label>
                             <input
                               id="temperature"
@@ -2646,7 +3839,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                     onChange={(e) => setTemperature(parseFloat(e.target.value))}
                               className="w-full"
                             />
-                            <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                            <div className="flex justify-between text-xs text-muted-foreground">
                               <span>Precise (0)</span>
                               <span>Balanced (0.7)</span>
                               <span>Creative (2)</span>
@@ -2655,9 +3848,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
                           {/* Top-P */}
                           <div>
-                            <label htmlFor="top-p" className="flex justify-between text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="top-p" className="flex justify-between text-sm font-medium text-foreground mb-1">
                               <span>Top-P</span>
-                              <span className="text-gray-500 dark:text-gray-400">{topP}</span>
+                              <span className="text-muted-foreground">{topP}</span>
                   </label>
                     <input
                               id="top-p"
@@ -2673,9 +3866,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
                           {/* Top-K */}
                           <div>
-                            <label htmlFor="top-k" className="flex justify-between text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="top-k" className="flex justify-between text-sm font-medium text-foreground mb-1">
                               <span>Top-K</span>
-                              <span className="text-gray-500 dark:text-gray-400">{topK}</span>
+                              <span className="text-muted-foreground">{topK}</span>
                             </label>
                             <input
                               id="top-k"
@@ -2691,14 +3884,14 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
                           {/* Format Option */}
                           <div>
-                            <label htmlFor="format" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="format" className="block text-sm font-medium text-foreground mb-1">
                               Response Format
                             </label>
                             <select
                               id="format"
                               value={formatOption}
                               onChange={(e) => setFormatOption(e.target.value)}
-                              className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                              className="w-full p-2 themed-select focus:ring-2 focus:ring-primary"
                             >
                               <option value="">Default</option>
                               <option value="json">JSON</option>
@@ -2707,7 +3900,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
                           {/* Suffix Text */}
                           <div>
-                            <label htmlFor="suffix" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="suffix" className="block text-sm font-medium text-foreground mb-1">
                               Suffix Text
                             </label>
                             <input
@@ -2715,21 +3908,21 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                       type="text"
                               value={suffixText}
                               onChange={(e) => setSuffixText(e.target.value)}
-                              className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                              className="w-full p-2 border border-border rounded-md bg-card text-card-foreground"
                               placeholder="Optional suffix to append to prompt"
                             />
                           </div>
 
                           {/* Keep-Alive */}
                           <div>
-                            <label htmlFor="keep-alive" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                            <label htmlFor="keep-alive" className="block text-sm font-medium text-foreground mb-1">
                               Keep-Alive Duration
                             </label>
                             <select
                               id="keep-alive"
                               value={keepAliveOption}
                               onChange={(e) => setKeepAliveOption(e.target.value)}
-                              className="w-full p-2 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                              className="w-full p-2 themed-select focus:ring-2 focus:ring-primary"
                             >
                               <option value="0s">None</option>
                               <option value="30s">30 seconds</option>
@@ -2749,9 +3942,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                                 type="checkbox"
                                 checked={thinkingEnabled}
                                 onChange={(e) => setThinkingEnabled(e.target.checked)}
-                                className="h-4 w-4 text-[#6C63FF] focus:ring-[#5754D2] border-gray-300 rounded"
+                                className="h-4 w-4 text-primary focus:ring-primary border-border rounded"
                               />
-                              <label htmlFor="thinking-mode" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
+                              <label htmlFor="thinking-mode" className="ml-2 block text-sm text-foreground">
                                 Enable thinking mode
                               </label>
                             </div>
@@ -2762,9 +3955,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                                 type="checkbox"
                                 checked={rawModeEnabled}
                                 onChange={(e) => setRawModeEnabled(e.target.checked)}
-                                className="h-4 w-4 text-[#6C63FF] focus:ring-[#5754D2] border-gray-300 rounded"
+                                className="h-4 w-4 text-primary focus:ring-primary border-border rounded"
                               />
-                              <label htmlFor="raw-mode" className="ml-2 block text-sm text-gray-700 dark:text-gray-300">
+                              <label htmlFor="raw-mode" className="ml-2 block text-sm text-foreground">
                                 Enable raw mode
                               </label>
                             </div>
@@ -2775,160 +3968,315 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                       {/* Appearance Settings */}
                       {settingsView === 'appearance' && (
                         <div className="space-y-8">
-                          <h3 className="text-lg font-medium text-gray-900 dark:text-white">Appearance</h3>
+                          <h3 className="text-lg font-medium text-foreground">Appearance</h3>
 
-                          {/* Theme Selector */}
+                          {/* Theme Selector - Direct approach with buttons */}
                           <div>
-                            <h4 className="text-base font-medium text-gray-800 dark:text-gray-200 mb-4">Select Theme</h4>
-                            <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-                              {/* Light Theme */}
-                              <div
-                                className={`cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${theme === 'light' ? 'border-[#6C63FF] shadow-md scale-[1.02]' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
-                                  }`}
+                            <h4 className="text-base font-medium text-foreground mb-4">Select Theme</h4>
+                            <div className="grid grid-cols-3 gap-3">
+                              {/* Light theme */}
+                              <button
                                 onClick={() => setAppTheme('light')}
+                                className={`flex flex-col items-center p-3 rounded-lg border transition-all ${
+                                  theme === 'light' ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted'
+                                }`}
                               >
-                                <div className="bg-white p-2 border-b border-gray-200">
-                                  <div className="flex items-center gap-1">
-                                    <div className="w-2 h-2 rounded-full bg-gray-300"></div>
-                                    <div className="w-12 h-2 bg-gray-200 rounded"></div>
-                                  </div>
-                                </div>
-                                <div className="bg-gray-50 p-2 h-20 flex flex-col">
-                                  <div className="w-3/4 h-2 bg-gray-200 rounded mb-1"></div>
-                                  <div className="w-1/2 h-2 bg-gray-200 rounded"></div>
-                                  <div className="flex-1"></div>
-                                  <div className="w-full h-4 bg-white border border-gray-200 rounded"></div>
-                                </div>
-                                <div className="p-2 bg-white text-center text-xs font-medium text-gray-600">
-                                  Light
-                                </div>
-                              </div>
-
-                              {/* Dark Theme */}
-                              <div
-                                className={`cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${theme === 'dark' ? 'border-[#6C63FF] shadow-md scale-[1.02]' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
-                                  }`}
+                                <Sun className="h-6 w-6 mb-2 text-foreground" />
+                                <span className="text-sm font-medium">Light</span>
+                              </button>
+                              
+                              {/* Dark theme */}
+                              <button
                                 onClick={() => setAppTheme('dark')}
+                                className={`flex flex-col items-center p-3 rounded-lg border transition-all ${
+                                  theme === 'dark' ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted'
+                                }`}
                               >
-                                <div className="bg-gray-900 p-2 border-b border-gray-700">
-                                  <div className="flex items-center gap-1">
-                                    <div className="w-2 h-2 rounded-full bg-gray-600"></div>
-                                    <div className="w-12 h-2 bg-gray-700 rounded"></div>
-                                  </div>
-                                </div>
-                                <div className="bg-gray-800 p-2 h-20 flex flex-col">
-                                  <div className="w-3/4 h-2 bg-gray-700 rounded mb-1"></div>
-                                  <div className="w-1/2 h-2 bg-gray-700 rounded"></div>
-                                  <div className="flex-1"></div>
-                                  <div className="w-full h-4 bg-gray-900 border border-gray-700 rounded"></div>
-                                </div>
-                                <div className="p-2 bg-gray-900 text-center text-xs font-medium text-gray-300">
-                                  Dark
-                                </div>
-                              </div>
-
-                              {/* Obsidian Theme */}
-                              <div
-                                className={`cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${theme === 'obsidian' ? 'border-[#6C63FF] shadow-md scale-[1.02]' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
-                                  }`}
+                                <Moon className="h-6 w-6 mb-2 text-foreground" />
+                                <span className="text-sm font-medium">Dark</span>
+                              </button>
+                              
+                              {/* Obsidian theme */}
+                              <button
                                 onClick={() => setAppTheme('obsidian')}
+                                className={`flex flex-col items-center p-3 rounded-lg border transition-all ${
+                                  theme === 'obsidian' ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted'
+                                }`}
                               >
-                                <div className="bg-black p-2 border-b border-gray-800">
-                                  <div className="flex items-center gap-1">
-                                    <div className="w-2 h-2 rounded-full bg-purple-700"></div>
-                                    <div className="w-12 h-2 bg-gray-800 rounded"></div>
-                                  </div>
-                                </div>
-                                <div className="bg-gray-900 p-2 h-20 flex flex-col">
-                                  <div className="w-3/4 h-2 bg-purple-900/50 rounded mb-1"></div>
-                                  <div className="w-1/2 h-2 bg-purple-900/50 rounded"></div>
-                                  <div className="flex-1"></div>
-                                  <div className="w-full h-4 bg-black border border-gray-800 rounded"></div>
-                                </div>
-                                <div className="p-2 bg-black text-center text-xs font-medium text-purple-300">
-                                  Obsidian
-                                </div>
-                              </div>
-
-                              {/* Nature Theme */}
-                              <div
-                                className={`cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${theme === 'nature' ? 'border-[#6C63FF] shadow-md scale-[1.02]' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
-                                  }`}
+                                <div className="h-6 w-6 mb-2 rounded-full bg-black border border-gray-700"></div>
+                                <span className="text-sm font-medium">Obsidian</span>
+                              </button>
+                              
+                              {/* Nature theme */}
+                              <button
                                 onClick={() => setAppTheme('nature')}
+                                className={`flex flex-col items-center p-3 rounded-lg border transition-all ${
+                                  theme === 'nature' ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted'
+                                }`}
                               >
-                                <div className="bg-green-900 p-2 border-b border-green-800">
-                                  <div className="flex items-center gap-1">
-                                    <div className="w-2 h-2 rounded-full bg-green-500"></div>
-                                    <div className="w-12 h-2 bg-green-800/70 rounded"></div>
-                                  </div>
-                                </div>
-                                <div className="bg-green-800 p-2 h-20 flex flex-col">
-                                  <div className="w-3/4 h-2 bg-green-700/50 rounded mb-1"></div>
-                                  <div className="w-1/2 h-2 bg-green-700/50 rounded"></div>
-                                  <div className="flex-1"></div>
-                                  <div className="w-full h-4 bg-green-900 border border-green-700/50 rounded"></div>
-                                </div>
-                                <div className="p-2 bg-green-900 text-center text-xs font-medium text-green-100">
-                                  Nature
-                                </div>
-                              </div>
-
-                              {/* Sunset Theme */}
-                              <div
-                                className={`cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${theme === 'sunset' ? 'border-[#6C63FF] shadow-md scale-[1.02]' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
-                                  }`}
+                                <div className="h-6 w-6 mb-2 rounded-full bg-green-800 border border-green-700"></div>
+                                <span className="text-sm font-medium">Nature</span>
+                              </button>
+                              
+                              {/* Sunset theme */}
+                              <button
                                 onClick={() => setAppTheme('sunset')}
+                                className={`flex flex-col items-center p-3 rounded-lg border transition-all ${
+                                  theme === 'sunset' ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted'
+                                }`}
                               >
-                                <div className="bg-gradient-to-r from-red-800 to-orange-700 p-2 border-b border-orange-900">
-                                  <div className="flex items-center gap-1">
-                                    <div className="w-2 h-2 rounded-full bg-yellow-500"></div>
-                                    <div className="w-12 h-2 bg-orange-800/70 rounded"></div>
+                                <div className="h-6 w-6 mb-2 rounded-full bg-amber-800 border border-amber-700"></div>
+                                <span className="text-sm font-medium">Sunset</span>
+                              </button>
+                              
+                              {/* Custom theme */}
+                              <button
+                                onClick={() => {
+                                  setAppTheme('custom');
+                                  // Show color customizer modal/section
+                                }}
+                                className={`flex flex-col items-center p-3 rounded-lg border transition-all ${
+                                  theme === 'custom' ? 'border-primary bg-primary/10' : 'border-border hover:bg-muted'
+                                }`}
+                              >
+                                <Palette className="h-6 w-6 mb-2 text-foreground" />
+                                <span className="text-sm font-medium">Custom</span>
+                              </button>
                                   </div>
                                 </div>
-                                <div className="bg-gradient-to-b from-orange-900 to-orange-950 p-2 h-20 flex flex-col">
-                                  <div className="w-3/4 h-2 bg-orange-700/50 rounded mb-1"></div>
-                                  <div className="w-1/2 h-2 bg-orange-700/50 rounded"></div>
-                                  <div className="flex-1"></div>
-                                  <div className="w-full h-4 bg-orange-950 border border-orange-800 rounded"></div>
+                          
+                          {/* Custom theme color picker - only show when custom theme is selected */}
+                          {theme === 'custom' && (
+                            <div className="space-y-4 p-4 border border-border rounded-md bg-card/50">
+                              <h4 className="text-base font-medium text-foreground">Custom Theme Colors</h4>
+                              
+                              <div className="grid grid-cols-2 gap-4">
+                                {/* Primary color section */}
+                                <div className="col-span-2 mb-2">
+                                  <h5 className="text-sm font-medium text-muted-foreground mb-2">Primary Colors</h5>
                                 </div>
-                                <div className="p-2 bg-orange-950 text-center text-xs font-medium text-orange-100">
-                                  Sunset
+                                
+                                <div>
+                                  <label className="block text-sm font-medium text-foreground mb-1">Primary</label>
+                                  <div className="flex items-center gap-2">
+                                    <input 
+                                      type="color" 
+                                      value={customThemeColors.primary}
+                                      onChange={(e) => handleCustomColorsChange({ 
+                                        ...customThemeColors, 
+                                        primary: e.target.value,
+                                        primaryHover: e.target.value 
+                                      })}
+                                      className="h-8 w-16 border-0 p-0 rounded"
+                                    />
+                                    <span className="text-xs text-muted-foreground">{customThemeColors.primary}</span>
                                 </div>
                               </div>
 
-                              {/* Custom Theme (Placeholder) */}
-                              <div
-                                className={`cursor-pointer rounded-lg overflow-hidden border-2 transition-all ${theme === 'custom' ? 'border-[#6C63FF] shadow-md scale-[1.02]' : 'border-gray-200 dark:border-gray-700 hover:border-gray-300 dark:hover:border-gray-600'
-                                  }`}
-                                onClick={() => setAppTheme('custom')}
-                              >
-                                <div className="bg-gradient-to-r from-[#5754D2] via-purple-700 to-pink-700 p-2">
-                                  <div className="flex items-center gap-1">
-                                    <div className="w-2 h-2 rounded-full bg-white"></div>
-                                    <div className="w-12 h-2 bg-white/30 rounded"></div>
+                                <div>
+                                  <label className="block text-sm font-medium text-foreground mb-1">Primary Hover</label>
+                                  <div className="flex items-center gap-2">
+                                    <input 
+                                      type="color" 
+                                      value={customThemeColors.primaryHover}
+                                      onChange={(e) => handleCustomColorsChange({ 
+                                        ...customThemeColors, 
+                                        primaryHover: e.target.value 
+                                      })}
+                                      className="h-8 w-16 border-0 p-0 rounded"
+                                    />
+                                    <span className="text-xs text-muted-foreground">{customThemeColors.primaryHover}</span>
                                   </div>
                                 </div>
-                                <div className="p-2 h-20 flex flex-col bg-gradient-to-b from-slate-900 to-slate-800">
-                                  <div className="w-3/4 h-2 bg-[#6C63FF]/30 rounded mb-1"></div>
-                                  <div className="w-1/2 h-2 bg-purple-500/30 rounded"></div>
-                                  <div className="flex-1"></div>
-                                  <div className="w-full h-4 bg-slate-900 border border-slate-700 rounded"></div>
+
+                                <div>
+                                  <label className="block text-sm font-medium text-foreground mb-1">Primary Foreground</label>
+                                  <div className="flex items-center gap-2">
+                                    <input 
+                                      type="color" 
+                                      value={customThemeColors.primaryForeground || "#FFFFFF"}
+                                      onChange={(e) => handleCustomColorsChange({ 
+                                        ...customThemeColors, 
+                                        primaryForeground: e.target.value 
+                                      })}
+                                      className="h-8 w-16 border-0 p-0 rounded"
+                                    />
+                                    <span className="text-xs text-muted-foreground">{customThemeColors.primaryForeground || "#FFFFFF"}</span>
                                 </div>
-                                <div className="p-2 bg-slate-900 text-center text-xs font-medium text-[#6C63FF]">
-                                  Custom
                                 </div>
+                                
+                                {/* Background color section */}
+                                <div className="col-span-2 mb-2 mt-4">
+                                  <h5 className="text-sm font-medium text-muted-foreground mb-2">Background Colors</h5>
+                              </div>
+
+                                <div>
+                                  <label className="block text-sm font-medium text-foreground mb-1">Background</label>
+                                  <div className="flex items-center gap-2">
+                                    <input 
+                                      type="color" 
+                                      value={customThemeColors.background}
+                                      onChange={(e) => handleCustomColorsChange({ 
+                                        ...customThemeColors, 
+                                        background: e.target.value 
+                                      })}
+                                      className="h-8 w-16 border-0 p-0 rounded"
+                                    />
+                                    <span className="text-xs text-muted-foreground">{customThemeColors.background}</span>
+                                  </div>
+                                </div>
+                                
+                                <div>
+                                  <label className="block text-sm font-medium text-foreground mb-1">Foreground</label>
+                                  <div className="flex items-center gap-2">
+                                    <input 
+                                      type="color" 
+                                      value={customThemeColors.foreground}
+                                      onChange={(e) => handleCustomColorsChange({ 
+                                        ...customThemeColors, 
+                                        foreground: e.target.value 
+                                      })}
+                                      className="h-8 w-16 border-0 p-0 rounded"
+                                    />
+                                    <span className="text-xs text-muted-foreground">{customThemeColors.foreground}</span>
+                                </div>
+                                </div>
+                                
+                                {/* Card color section */}
+                                <div className="col-span-2 mb-2 mt-4">
+                                  <h5 className="text-sm font-medium text-muted-foreground mb-2">Card Colors</h5>
+                              </div>
+
+                                <div>
+                                  <label className="block text-sm font-medium text-foreground mb-1">Card</label>
+                                  <div className="flex items-center gap-2">
+                                    <input 
+                                      type="color" 
+                                      value={customThemeColors.card}
+                                      onChange={(e) => handleCustomColorsChange({ 
+                                        ...customThemeColors, 
+                                        card: e.target.value 
+                                      })}
+                                      className="h-8 w-16 border-0 p-0 rounded"
+                                    />
+                                    <span className="text-xs text-muted-foreground">{customThemeColors.card}</span>
+                                  </div>
+                                </div>
+
+                                <div>
+                                  <label className="block text-sm font-medium text-foreground mb-1">Card Foreground</label>
+                                  <div className="flex items-center gap-2">
+                                    <input 
+                                      type="color" 
+                                      value={customThemeColors.cardForeground || "#000000"}
+                                      onChange={(e) => handleCustomColorsChange({ 
+                                        ...customThemeColors, 
+                                        cardForeground: e.target.value 
+                                      })}
+                                      className="h-8 w-16 border-0 p-0 rounded"
+                                    />
+                                    <span className="text-xs text-muted-foreground">{customThemeColors.cardForeground || "#000000"}</span>
+                                </div>
+                                </div>
+                              </div>
+
+                              {/* Theme management buttons */}
+                              <div className="mt-6 border-t border-border pt-4">
+                                <h4 className="text-base font-medium text-foreground mb-3">Theme Management</h4>
+                                
+                                {/* Save Theme Section */}
+                                <div className="mb-4">
+                                  <label className="block text-sm font-medium text-foreground mb-2">Save Custom Theme</label>
+                                  <div className="flex gap-2">
+                                    <input
+                                      type="text"
+                                      value={themeNameInput}
+                                      onChange={(e) => setThemeNameInput(e.target.value)}
+                                      placeholder="Theme name"
+                                      className="flex-1 p-2 text-sm border border-border rounded-md bg-card text-card-foreground"
+                                    />
+                                    <button
+                                      onClick={saveThemeToMongoDB}
+                                      className="px-3 py-2 bg-primary hover:bg-primary-hover text-primary-foreground rounded-md text-sm whitespace-nowrap"
+                                      disabled={!themeNameInput.trim()}
+                                    >
+                                      Save Theme
+                                    </button>
+                                  </div>
+                                </div>
+                                
+                                {/* Import/Export Section */}
+                                <div className="flex gap-2 mb-4">
+                                  <button
+                                    onClick={exportTheme}
+                                    className="flex-1 px-3 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md text-sm"
+                                  >
+                                    Export Theme
+                                  </button>
+                                  
+                                  <label
+                                    className="flex-1 px-3 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md text-sm flex items-center justify-center cursor-pointer"
+                                  >
+                                    Import Theme
+                                    <input
+                                      type="file"
+                                      onChange={importTheme}
+                                      className="hidden"
+                                      accept=".json"
+                                    />
+                                  </label>
+                              </div>
+
+                                {/* Saved Themes Section */}
+                                {savedThemes.length > 0 && (
+                                  <div>
+                                    <label className="block text-sm font-medium text-foreground mb-2">Saved Themes</label>
+                                    <div className="max-h-32 overflow-y-auto border border-border rounded-md">
+                                      {savedThemes.map((theme) => (
+                                        <div 
+                                          key={theme._id} 
+                                          className="flex items-center justify-between p-2 hover:bg-muted border-b border-border last:border-b-0"
+                                        >
+                                          <span className="text-sm truncate flex-1">{theme.name}</span>
+                                          <div className="flex space-x-1">
+                                            <button
+                                              onClick={() => loadSavedTheme(theme)}
+                                              className="p-1 text-xs bg-primary/10 hover:bg-primary/20 text-primary rounded"
+                                              title="Load theme"
+                                            >
+                                              Load
+                                            </button>
+                                            <button
+                                              onClick={() => deleteSavedTheme(theme._id)}
+                                              className="p-1 text-xs bg-red-500/10 hover:bg-red-500/20 text-red-500 rounded"
+                                              title="Delete theme"
+                                            >
+                                              Delete
+                                            </button>
+                                  </div>
+                                </div>
+                                      ))}
+                                </div>
+                                </div>
+                                )}
                               </div>
                             </div>
-                          </div>
+                          )}
 
                           {/* UI Density */}
                           <div className="space-y-3">
-                            <h4 className="text-base font-medium text-gray-800 dark:text-gray-200">UI Density</h4>
+                            <h4 className="text-base font-medium text-foreground">UI Density</h4>
                             <div className="flex space-x-4">
-                              <button className="px-4 py-2 bg-[#6C63FF]/10 dark:bg-[#5754D2]/30 text-[#6C63FF] dark:text-[#5754D2] rounded-md text-sm font-medium">
+                              <button 
+                                className={`px-4 py-2 ${uiDensity === 'comfortable' ? 'bg-primary/10 text-primary' : 'bg-card border border-border text-muted-foreground'} rounded-md text-sm font-medium transition-colors`}
+                                onClick={() => setUiDensityPreference('comfortable')}
+                              >
                                 Comfortable
                               </button>
-                              <button className="px-4 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-md text-gray-700 dark:text-gray-300 text-sm">
+                              <button 
+                                className={`px-4 py-2 ${uiDensity === 'compact' ? 'bg-primary/10 text-primary' : 'bg-card border border-border text-muted-foreground'} rounded-md text-sm transition-colors`}
+                                onClick={() => setUiDensityPreference('compact')}
+                              >
                                 Compact
                     </button>
                   </div>
@@ -2937,18 +4285,24 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                           {/* Font Size */}
                           <div className="space-y-3">
                             <div className="flex justify-between">
-                              <h4 className="text-base font-medium text-gray-800 dark:text-gray-200">Font Size</h4>
-                              <span className="text-sm text-gray-500 dark:text-gray-400">Medium</span>
+                              <h4 className="text-base font-medium text-foreground">Font Size</h4>
+                              <span className="text-sm text-muted-foreground">
+                                {fontSize === 1 ? 'Small' : 
+                                 fontSize === 2 ? 'Medium-Small' : 
+                                 fontSize === 3 ? 'Medium' : 
+                                 fontSize === 4 ? 'Medium-Large' : 'Large'}
+                              </span>
                             </div>
                             <input
                               type="range"
                               min="1"
                               max="5"
                               step="1"
-                              defaultValue="3"
+                              value={fontSize}
+                              onChange={(e) => setFontSizePreference(parseInt(e.target.value, 10))}
                               className="w-full"
                             />
-                            <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400">
+                            <div className="flex justify-between text-xs text-muted-foreground">
                               <span>Small</span>
                               <span>Medium</span>
                               <span>Large</span>
@@ -2957,44 +4311,40 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                         </div>
                       )}
 
-                      {/* Updates */}
+                      {/* Updates Tab */}
                       {settingsView === 'updates' && (
                         <div className="space-y-6">
-                          <h3 className="text-lg font-medium text-gray-900 dark:text-white">Updates</h3>
+                          <div>
+                            <h3 className="text-lg font-medium text-foreground">Updates</h3>
+                            <p className="text-sm text-muted-foreground">Check for updates and see what's new.</p>
+                          </div>
 
-                          <div className="bg-[#6C63FF]/5 dark:bg-[#5754D2]/20 p-4 rounded-md">
+                          <div className="bg-primary/5 p-4 rounded-md">
                             <div className="flex items-start">
-                              <div className="mr-3 flex-shrink-0 text-[#6C63FF]">
-                                <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 20 20">
-                                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2h-1V9z" clipRule="evenodd" />
-                                </svg>
+                              <div className="mr-3 flex-shrink-0 text-primary">
+                                <Info size={20} />
                               </div>
                               <div>
-                                <h4 className="text-sm font-medium text-[#6C63FF] dark:text-[#5754D2]">Current Version</h4>
-                                <div className="mt-1 text-sm text-[#6C63FF] dark:text-[#5754D2]">
-                                  SiLynkr {getVersionString()}
-                                  <span className="ml-2 text-xs bg-green-100 dark:bg-green-800 text-green-800 dark:text-green-200 py-0.5 px-1.5 rounded">Up to date</span>
+                                <h4 className="text-sm font-medium text-primary">Current Version</h4>
+                                <div className="mt-1 text-sm text-primary">
+                                  {versionInfo.displayVersion} ({versionInfo.versionType.charAt(0).toUpperCase() + versionInfo.versionType.slice(1)})
                                 </div>
                               </div>
                             </div>
                           </div>
 
-                          <div className="border border-gray-200 dark:border-gray-700 rounded-md overflow-hidden">
-                            <div className="bg-gray-50 dark:bg-gray-800 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300">
-                              Update History
-                            </div>
-                            <div className="p-4 space-y-4">
                               <div>
-                                <h4 className="text-sm font-medium text-gray-900 dark:text-white">Version 1.0.0-beta</h4>
-                                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">Released on April 15, 2023</p>
-                                <ul className="mt-2 text-sm text-gray-600 dark:text-gray-400 space-y-1 list-disc list-inside">
-                                  <li>Initial release</li>
-                                  <li>Support for Ollama models</li>
-                                  <li>Conversation management</li>
-                                  <li>Dark mode support</li>
-                                </ul>
-                              </div>
+                            <div className="w-16 h-16 mb-4 bg-primary/10 rounded-full flex items-center justify-center">
+                              <svg className="w-8 h-8 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                              </svg>
                             </div>
+                            <h3 className="text-lg font-medium text-foreground mb-2">What's New in {versionInfo.displayVersion}</h3>
+                            <ul className="list-disc pl-5 space-y-2 text-sm text-foreground">
+                              {versionInfo.changelog.map((item, index) => (
+                                <li key={index}>{item}</li>
+                              ))}
+                                </ul>
                           </div>
                         </div>
                       )}
@@ -3008,13 +4358,13 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                 <div className={`${!sidebarOpen ? 'container mx-auto px-4' : ''}`}>
                   {messages.length === 0 ? (
                     <div className="h-full flex flex-col items-center justify-center text-center p-6">
-                      <div className="w-16 h-16 mb-4 bg-[#6C63FF]/10 dark:bg-[#5754D2]/30 rounded-full flex items-center justify-center">
-                        <svg className="w-8 h-8 text-[#6C63FF] dark:text-[#5754D2]" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                      <div className="w-16 h-16 mb-4 bg-primary/10 rounded-full flex items-center justify-center">
+                        <svg className="w-8 h-8 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
                         </svg>
                       </div>
-                      <h3 className="text-lg font-medium text-gray-900 dark:text-white mb-1">Start a conversation</h3>
-                      <p className="text-gray-500 dark:text-gray-400 max-w-md">
+                      <h3 className="text-lg font-medium text-foreground mb-1">Start a conversation</h3>
+                      <p className="text-muted-foreground max-w-md">
                         Ask questions, get creative responses, or explore what your local AI model can do.
                   </p>
                 </div>
@@ -3026,14 +4376,21 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                           role={message.role}
                           content={message.content}
                           timestamp={message.timestamp}
+                          isStreaming={index === streamingMessageIndex}
                           models={models}
                           onRegenerate={message.role === 'assistant' ? (modelName) => regenerateMessage(index, modelName) : undefined}
                           onLike={message.role === 'assistant' ? () => handleMessageFeedback(index, 'liked') : undefined}
                           onDislike={message.role === 'assistant' ? () => handleMessageFeedback(index, 'disliked') : undefined}
                           onEdit={message.role === 'assistant' ? () => startEditingMessage(index) : undefined}
+                          onSaveEdit={message.role === 'assistant' ? (newContent, jsonContent) => saveEditedMessage(index, newContent, jsonContent) : undefined}
                           alternateVersions={message.role === 'assistant' ? (messageVersions[index] || [message.content]) : []}
                           currentVersionIndex={message.role === 'assistant' ? (currentMessageVersions[index] || 0) : 0}
                           onSelectVersion={message.role === 'assistant' ? (versionIndex) => selectMessageVersion(index, versionIndex) : undefined}
+                          isEditing={editingMessageIndex === index}
+                          comments={message.comments}
+                          onAddComment={message.role === 'assistant' ? (text, color) => addCommentToMessage(index, text, color) : undefined}
+                          onDeleteComment={message.role === 'assistant' ? (commentId) => deleteCommentFromMessage(index, commentId) : undefined}
+                          feedback={message.feedback}
                         />
                       ))}
                       <div ref={messagesEndRef} />
@@ -3042,11 +4399,11 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                   {loading && (
                     <div className="flex items-center justify-center py-4">
                       <div className="animate-pulse flex space-x-2">
-                        <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                        <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                        <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                        <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
-                        <div className="h-2 w-2 bg-gray-400 dark:bg-gray-600 rounded-full"></div>
+                        <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                        <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                        <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                        <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
+                        <div className="h-2 w-2 bg-muted-foreground rounded-full"></div>
                       </div>
                     </div>
                   )}
@@ -3056,7 +4413,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
           
             {/* Input Area - only show when not in settings view */}
             {!showSettings && (
-          <div className="border-t dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+          <div className="border-t border-border bg-card p-4">
                 <form onSubmit={handleSubmit} className={`${!sidebarOpen ? 'container mx-auto' : ''} max-w-3xl mx-auto`}>
               <div className="relative">
                 <textarea
@@ -3070,13 +4427,24 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                   }}
                       placeholder="Message SiLynkr..."
                   rows={1}
-                  className="w-full p-3 pr-24 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-[#6C63FF] focus:border-transparent resize-none overflow-hidden"
+                  className="w-full p-3 pr-24 border border-border rounded-lg bg-card text-card-foreground focus:ring-2 focus:ring-primary focus:border-transparent resize-none overflow-hidden"
                   disabled={loading}
                 />
                 <div className="absolute right-2 bottom-2 flex items-center space-x-1">
+                  {loading && streamingMessageIndex !== null && (
+                    <button
+                      type="button"
+                      onClick={pauseGeneration}
+                      className="bg-muted hover:bg-muted/80 text-foreground p-1.5 rounded-md transition-colors flex items-center justify-center"
+                      title="Pause"
+                      aria-label="Pause generating"
+                    >
+                      <Pause className="h-5 w-5" />
+                    </button>
+                  )}
                   <button
                     type="submit"
-                    className="bg-[#6C63FF] hover:bg-[#5754D2] text-white p-1.5 rounded-md transition-colors flex items-center justify-center disabled:bg-[#6C63FF]/50 dark:disabled:bg-[#5754D2]/50 disabled:cursor-not-allowed"
+                    className="bg-primary hover:bg-primary-hover text-primary-foreground p-1.5 rounded-md transition-colors flex items-center justify-center disabled:bg-primary/50 disabled:cursor-not-allowed"
                     disabled={loading || !selectedModel || !input.trim()}
                   >
                     <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
@@ -3094,7 +4462,7 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
 
                   {/* Token usage display */}
                   {showTokenUsage && (
-                    <div className="text-xs text-gray-500 dark:text-gray-400 mt-2 flex justify-center gap-4">
+                    <div className="text-xs text-muted-foreground mt-2 flex justify-center gap-4">
                       <span>Prompt: {promptTokens} tokens</span>
                       <span>Response: {completionTokens} tokens</span>
                       <span>Total: {totalTokens} tokens</span>
@@ -3107,59 +4475,96 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
         </div>
 
         {/* Context Menu */}
-        {contextMenuPosition.conversation && (
+        {contextMenuPosition.show && (
           <>
             <div
               className="fixed inset-0 z-40"
               onClick={closeContextMenu}
             />
             <div
-              className="fixed z-50 bg-white dark:bg-gray-800 rounded-md shadow-lg py-1 w-48 border border-gray-200 dark:border-gray-700"
+              className="fixed z-50 bg-card rounded-md shadow-lg py-1 w-48 border border-border"
               style={{
                 top: `${contextMenuPosition.y}px`,
                 left: `${contextMenuPosition.x}px`,
                 transform: 'translate(-50%, -50%)'
               }}
             >
+              {contextMenuPosition.isRenaming ? (
+                <div className="px-3 py-2">
+                  <input
+                    ref={renameInputRef}
+                    type="text"
+                    value={renameInputValue}
+                    onChange={(e) => setRenameInputValue(e.target.value)}
+                    className="w-full p-1 border border-border rounded bg-card text-foreground"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && contextMenuPosition.conversation) {
+                        renameConversation(contextMenuPosition.conversation._id, renameInputValue);
+                      } else if (e.key === 'Escape') {
+                        closeContextMenu();
+                      }
+                    }}
+                    onBlur={() => {
+                      if (contextMenuPosition.conversation) {
+                        renameConversation(contextMenuPosition.conversation._id, renameInputValue);
+                      }
+                    }}
+                  />
+                </div>
+              ) : (
+                <>
               <button
                 onClick={() => loadConversation(contextMenuPosition.conversation!)}
-                className="px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 w-full text-left flex items-center"
+                    className="px-4 py-2 text-sm text-card-foreground hover:bg-muted w-full text-left flex items-center"
               >
                 <MessageSquare size={14} className="mr-2" />
                 Open
               </button>
+                  <button
+                    onClick={() => {
+                      if (contextMenuPosition.conversation) {
+                        startRenamingConversation(contextMenuPosition.conversation);
+                      }
+                    }}
+                    className="px-4 py-2 text-sm text-card-foreground hover:bg-muted w-full text-left flex items-center"
+                  >
+                    <Edit size={14} className="mr-2" />
+                    Rename
+                  </button>
               <button
                 onClick={() => showMoveFolderDialog(contextMenuPosition.conversation!)}
-                className="px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 w-full text-left flex items-center"
+                    className="px-4 py-2 text-sm text-card-foreground hover:bg-muted w-full text-left flex items-center"
               >
                 <FolderIcon size={14} className="mr-2" />
                 Move to Folder
               </button>
-              <hr className="my-1 border-gray-200 dark:border-gray-700" />
+                  <hr className="my-1 border-border" />
               <button
                 onClick={() => deleteConversation(contextMenuPosition.conversation!)}
-                className="px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-gray-100 dark:hover:bg-gray-700 w-full text-left flex items-center"
+                    className="px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-muted w-full text-left flex items-center"
               >
                 <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                 </svg>
                 Delete
               </button>
+                </>
+              )}
             </div>
           </>
         )}
 
         {/* Move Dialog */}
         {showMoveDialog && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm bg-white/30 dark:bg-gray-900/30">
-            <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl p-6 w-96 max-w-md transform transition-all animate-fade-in-up">
-              <h2 className="text-xl font-medium mb-4 text-gray-900 dark:text-white flex items-center">
-                <FolderIcon size={18} className="mr-2 text-[#6C63FF] dark:text-[#5754D2]" />
+          <div className="fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm bg-black/30 dark:bg-white/10">
+            <div className="bg-card rounded-lg shadow-xl p-6 w-96 max-w-md transform transition-all animate-fade-in-up border border-border">
+              <h2 className="text-xl font-medium mb-4 text-foreground flex items-center">
+                <FolderIcon size={18} className="mr-2 text-primary" />
                 {isFolderMove ? 'Move Folder' : 'Move Conversation'}
               </h2>
 
               <div className="mb-6">
-                <label htmlFor="folder-select" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                <label htmlFor="folder-select" className="block text-sm font-medium text-card-foreground mb-2">
                   Select destination folder
                 </label>
                 <select
@@ -3169,10 +4574,9 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                     const value = e.target.value;
                     setTargetFolderId(value === '' ? null : value);
                   }}
-                  className="w-full p-2.5 border border-gray-300 dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-[#6C63FF] focus:border-transparent shadow-sm"
-                  style={{ textIndent: '0px' }}
+                  className="w-full p-2.5 themed-select focus:ring-2 focus:ring-primary shadow-sm"
                 >
-                  <option value="">None (Root)</option>
+                  <option value="" className="py-2 bg-card text-card-foreground">None (Root)</option>
                   {(() => {
                     // Get folder hierarchy
                     const { rootFolders, childFolders } = getFolderHierarchy(folders);
@@ -3212,13 +4616,13 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
                     setFolderToMove(null);
                     setIsFolderMove(false);
                   }}
-                  className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                  className="px-4 py-2 border border-border rounded-md text-sm font-medium text-card-foreground hover:bg-muted transition-colors"
                 >
                   Cancel
                 </button>
                 <button
                   onClick={isFolderMove ? moveFolder : moveConversation}
-                  className="px-4 py-2 bg-[#6C63FF] hover:bg-[#5754D2] text-white rounded-md text-sm font-medium transition-colors shadow-sm"
+                  className="px-4 py-2 bg-primary hover:bg-primary-hover text-primary-foreground rounded-md text-sm font-medium transition-colors shadow-sm"
                 >
                   Move
                 </button>
@@ -3276,58 +4680,93 @@ export default function ChatInterface({ conversationId }: ChatInterfaceProps = {
             setThinkingEnabled={setThinkingEnabled}
             rawModeEnabled={rawModeEnabled}
             setRawModeEnabled={setRawModeEnabled}
+            ollamaConnectionMode={ollamaConnectionMode}
+            setOllamaConnectionMode={setOllamaConnectionMode}
+            ollamaBaseUrl={ollamaBaseUrl}
+            setOllamaBaseUrl={setOllamaBaseUrl}
+            saveOllamaConnection={saveOllamaConnection}
           />
         )}
 
         {/* Folder Context Menu */}
-        {folderContextMenu.folder && (
+        {folderContextMenu.show && (
           <>
             <div
               className="fixed inset-0 z-40"
               onClick={closeFolderContextMenu}
             />
             <div
-              className="fixed z-50 bg-white dark:bg-gray-800 rounded-md shadow-lg py-1 w-48 border border-gray-200 dark:border-gray-700"
+              className="fixed z-50 bg-card rounded-md shadow-lg py-1 w-52 border border-border"
               style={{
                 top: `${folderContextMenu.y}px`,
                 left: `${folderContextMenu.x}px`,
                 transform: 'translate(-50%, -50%)'
               }}
             >
+              {folderContextMenu.isRenaming ? (
+                <div className="px-3 py-2">
+                  <input
+                    ref={renameInputRef}
+                    type="text"
+                    value={renameInputValue}
+                    onChange={(e) => setRenameInputValue(e.target.value)}
+                    className="w-full p-1 border border-border rounded bg-card text-foreground"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && folderContextMenu.folder) {
+                        renameFolder(folderContextMenu.folder._id, renameInputValue);
+                      } else if (e.key === 'Escape') {
+                        closeFolderContextMenu();
+                      }
+                    }}
+                    onBlur={() => {
+                      if (folderContextMenu.folder) {
+                        renameFolder(folderContextMenu.folder._id, renameInputValue);
+                      }
+                    }}
+                  />
+                </div>
+              ) : (
+                <>
               <button
                 onClick={() => startCreateSubfolder(folderContextMenu.folder!._id)}
-                className="px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 w-full text-left flex items-center"
+                    className="px-4 py-2 text-sm text-card-foreground hover:bg-muted w-full text-left flex items-center"
               >
-                <FolderIcon size={14} className="mr-2" />
+                    <FolderPlus size={14} className="mr-2" />
                 Add Subfolder
               </button>
               <button
-                onClick={() => showMoveFolderToFolderDialog(folderContextMenu.folder!)}
-                className="px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 w-full text-left flex items-center"
-              >
-                <FolderIcon size={14} className="mr-2" />
-                Move Folder
+                    onClick={() => {
+                      if (folderContextMenu.folder) {
+                        startRenamingFolder(folderContextMenu.folder);
+                      }
+                    }}
+                    className="px-4 py-2 text-sm text-card-foreground hover:bg-muted w-full text-left flex items-center"
+                  >
+                    <Edit size={14} className="mr-2" />
+                    Rename
               </button>
               <button
                 onClick={() => {
                   console.log('Change color button clicked', folderContextMenu);
                   showFolderColorPicker(folderContextMenu.folder!, folderContextMenu.x, folderContextMenu.y - 50);
                 }}
-                className="px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 w-full text-left flex items-center"
+                    className="px-4 py-2 text-sm text-card-foreground hover:bg-muted w-full text-left flex items-center"
               >
-                <span className="mr-2 w-3 h-3 rounded-full" style={{ backgroundColor: folderContextMenu.folder?.color || '#6C63FF' }}></span>
+                    <span className="mr-2 w-3 h-3 rounded-full" style={{ backgroundColor: folderContextMenu.folder?.color || 'rgb(var(--primary))' }}></span>
                 Change Color
               </button>
-              <hr className="my-1 border-gray-200 dark:border-gray-700" />
+                  <hr className="my-1 border-border" />
               <button
                 onClick={() => deleteFolder(folderContextMenu.folder!._id)}
-                className="px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-gray-100 dark:hover:bg-gray-700 w-full text-left flex items-center"
+                    className="px-4 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-muted w-full text-left flex items-center"
               >
                 <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                 </svg>
                 Delete
               </button>
+                </>
+              )}
             </div>
           </>
         )}
