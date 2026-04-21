@@ -164,6 +164,68 @@ If no MongoDB connection is available, the app will use localStorage.
 - **Database**: MongoDB with localStorage fallback
 - **AI Integration**: Connects to local Ollama instance
 
+## 🔒 Hosted Website + Local Ollama via HTTPS Proxy (mkcert)
+
+If you use the hosted website but want each user to run Ollama on their own device, you can run a local HTTPS proxy.
+
+### Why this exists
+
+- Avoid mixed-content issues (`https` website calling `http://localhost`)
+- Add required CORS headers
+- Handle Private Network Access (PNA) preflight headers
+
+### 1) Generate local certs with mkcert
+
+Install mkcert and run:
+
+```bash
+mkcert -install
+mkcert localhost 127.0.0.1 ::1
+```
+
+This creates files like:
+
+- `localhost.pem`
+- `localhost-key.pem`
+
+Place them in the project root (or configure custom paths via env vars below).
+
+### 2) Configure proxy env (optional)
+
+Create/update `.env.local`:
+
+```bash
+OLLAMA_HTTPS_PROXY_PORT=11443
+OLLAMA_PROXY_TARGET=http://127.0.0.1:11434
+OLLAMA_PROXY_CERT=localhost.pem
+OLLAMA_PROXY_KEY=localhost-key.pem
+OLLAMA_PROXY_ALLOWED_ORIGINS=https://yourdomain.com,http://localhost:49494
+```
+
+### 3) Run the proxy
+
+```bash
+npm run dev:ollama-proxy
+```
+
+Proxy endpoint:
+
+- `https://localhost:11443`
+
+### 4) Set SiLynkr connection mode
+
+In SiLynkr Settings:
+
+- Set **Ollama Connection Mode** to **Browser Local**
+- Set **Ollama Base URL** to `https://localhost:11443/api`
+- Save and test connection
+
+### Notes
+
+- This proxy adds CORS and `Access-Control-Allow-Private-Network: true` on preflight and proxied responses.
+- Some browsers may still enforce additional private-network policies depending on context.
+- For maximum reliability, full local mode (`http://localhost:49494`) is still recommended.
+
 ## 👩‍💻 Development
 
 ### Available Scripts
