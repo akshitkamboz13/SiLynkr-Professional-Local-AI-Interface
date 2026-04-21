@@ -1,6 +1,6 @@
 {
   "name": "silynkr",
-  "version": "1.2.0-beta",
+  "version": "1.2.1-beta",
   "description": "SiLynkr - A modern, feature-rich web interface for Ollama AI models by Si4k (si4k.me)",
   "private": true,
   "scripts": {
@@ -15,19 +15,28 @@
     "dev:all": "concurrently \"npm run dev\" \"npm run api\""
   },
   "dependencies": {
+    "@tiptap/extension-code-block": "^2.14.0",
+    "@tiptap/extension-highlight": "^2.14.0",
+    "@tiptap/extension-mention": "^2.14.0",
+    "@tiptap/pm": "^2.14.0",
+    "@tiptap/react": "^2.14.0",
+    "@tiptap/starter-kit": "^2.14.0",
+    "@types/jsdom": "^21.1.7",
     "@types/react-dnd": "^2.0.36",
     "axios": "^1.9.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "file-saver": "^2.0.5",
+    "html-to-markdown": "^1.0.0",
     "html2canvas": "^1.4.1",
+    "jsdom": "^26.1.0",
     "jspdf": "^3.0.1",
     "katex": "^0.16.22",
     "lucide-react": "^0.507.0",
     "mongodb": "^6.3.0",
     "mongoose": "^8.0.3",
-    "next": "15.3.1",
+    "next": "^15.5.15",
     "qrcode.react": "^4.2.0",
     "react": "^19.0.0",
     "react-colorful": "^5.6.1",
@@ -38,21 +47,25 @@
     "react-syntax-highlighter": "^15.6.1",
     "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
-    "remark-math": "^6.0.0"
+    "remark-math": "^6.0.0",
+    "turndown": "^7.2.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
-    "@tailwindcss/postcss": "^4.1.8",
+    "@isaacs/fs-minipass": "^4.0.1",
+    "@tailwindcss/postcss": "^4.1.10",
+    "@tailwindcss/typography": "^0.5.16",
     "@types/file-saver": "^2.0.7",
     "@types/katex": "^0.16.7",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/react-syntax-highlighter": "^15.5.13",
+    "autoprefixer": "^10.4.20",
     "concurrently": "^8.2.2",
     "eslint": "^9",
-    "eslint-config-next": "15.3.1",
-    "tailwindcss": "^4",
+    "eslint-config-next": "^15.5.15",
+    "tailwindcss": "^4.1.10",
     "typescript": "^5"
   }
 }
